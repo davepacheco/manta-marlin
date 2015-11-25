@@ -79,15 +79,41 @@
  *     zones.  If there are two task groups of equal size (see below), they
  *     should each get half of the non-reserved zones.
  *
- *     A task group's share of zones is determined by the number of tasks ready
- *     to run in that group divided by the total number of tasks ready to run in
- *     the system, except that the share cannot be less than 1 zone.  (Using
- *     tasks instead of counting each task group once avoids having users break
- *     up large jobs into multiple smaller ones just to get more concurrency.)
+ *     A task group's share of zones is determined by a combination of three
+ *     measures of that group's "share":
+ *
+ *         o concurrency share: the number of tasks ready to run in that group
+ *           divided by the total number of tasks ready to run in the system.
+ *           Counting tasks instead of counting each task group once avoids
+ *           having users break up large jobs into multiple smaller ones just to
+ *           get more concurrency.  Using this share causes the system to
+ *           allocate the zones themselves fairly.
+ *
+ *         o memory share: similar to the concurrency share, but where each task
+ *           is multiplied by the amount of extra memory requested for that
+ *           task.  Using this share causes the system to allocate memory from
+ *           the slop pool fairly (instead of allowing a high-concurrency job to
+ *           use all available memory slop).
+ *
+ *         o disk share: similar to the concurrency share, but where each task
+ *           is multiplied by the amount of extra disk requested for that task.
+ *           Using this share causes the system to allocate disk from the slop
+ *           pool fairly (instead of allowing a high-concurrency job to use all
+ *           available disk slop).
+ *
+ *     The group's overall share is the minimum of these shares.  If this number
+ *     is less than one zone, the share is determined to be one zone.
+ *
  *     As an example, if a system with 512 non-reserved zones has one task group
  *     with 50 tasks ready to run, and another task group with 150 tasks ready
  *     to run, then the first group gets 128 zones and the second group gets
  *     384.
+ *
+ *     As an example that considers memory or disk share: if the first task
+ *     group in the above example requires 1GB of slop memory per zone, and
+ *     there are 50GB of total slop memory, then the first task group will only
+ *     get 50 zones instead of 128.  (The share of the second group is
+ *     unchanged, unfortunately leaving a number of zones unallocatable.)
  *
  * (4) We assume that setting up a zone for a particular task group is
  *     relatively cheap, that running a subsequent task from the same group in
@@ -273,16 +299,6 @@ var maOutOfMemoryError = {
 var maNoImageError = {
     'code': EM_INVALIDARGUMENT,
     'message': 'failed to dispatch task: requested image is not available'
-};
-
-var maNoMemError = {
-    'code': EM_TASKINIT,
-    'message': 'failed to dispatch task: not enough memory available'
-};
-
-var maNoDiskError = {
-    'code': EM_TASKINIT,
-    'message': 'failed to dispatch task: not enough disk space available'
 };
 
 var maKilledError = {
@@ -544,6 +560,7 @@ function mAgent(filename)
 	var pct = this.ma_conf['tunables']['zoneMemorySlopPercent'] / 100;
 	this.ma_slopmem = Math.floor(pct * mod_os.totalmem() / 1024 / 1024);
 	this.ma_slopmem_used = 0;
+	this.ma_slopmem_wanted = 0;	/* total amount of memory slop wanted */
 
 	/*
 	 * Disk space management: we take a similar approach for managing disk
@@ -552,6 +569,7 @@ function mAgent(filename)
 	 */
 	this.ma_slopdisk = 0;
 	this.ma_slopdisk_used = 0;
+	this.ma_slopdisk_wanted = 0;	/* total amount of disk slop wanted */
 }
 
 /*
@@ -813,7 +831,7 @@ mAgent.prototype.tick = function ()
 	}
 
 	if (maCheckNTasks)
-		this.checkTaskCount();
+		this.checkTaskAccounting();
 
 	this.ma_tick_done = new Date();
 };
@@ -1009,26 +1027,29 @@ mAgent.prototype.tasksCheckpoint = function (force)
  * In debug mode, we periodically check that the total number of tasks in the
  * system matches what we expect.
  */
-mAgent.prototype.checkTaskCount = function ()
+mAgent.prototype.checkTaskAccounting = function ()
 {
 	var agent = this;
 	var log = this.ma_log;
 	var found, taskcount;
+	var foundmem, founddisk;
 
 	taskcount = 0;
 	mod_jsprim.forEachKey(this.ma_tasks, function () { taskcount++; });
 
 	if (taskcount != this.ma_ntasks) {
-		log.fatal('checkTaskCount failed: ma_ntasks = %d, but ' +
+		log.fatal('checkTaskAccounting failed: ma_ntasks = %d, but ' +
 		    'found %d tasks in ma_tasks', this.ma_ntasks, taskcount);
 		process.abort();
 	}
 
 	found = {};
+	foundmem = 0;
+	founddisk = 0;
 	mod_jsprim.forEachKey(this.ma_taskgroups, function (_, group) {
 		group.g_tasks.forEach(function (task, i) {
 			if (!agent.ma_tasks.hasOwnProperty(task.t_id)) {
-				log.fatal('checkTaskCount failed: ' +
+				log.fatal('checkTaskAccounting failed: ' +
 				    'found task "%s" on group "%s" idx %d ' +
 				    'not in ma_tasks', task.t_id,
 				    group.g_groupid, i);
@@ -1038,13 +1059,20 @@ mAgent.prototype.checkTaskCount = function ()
 			found[task.t_id] = true;
 		});
 
+		if (group.g_phase) {
+			foundmem += agent.taskGroupMemSlop(group) *
+			    group.g_tasks.length;
+			founddisk += agent.taskGroupDiskSlop(group) *
+			    group.g_tasks.length;
+		}
+
 		mod_jsprim.forEachKey(group.g_streams, function (__, stream) {
 			if (stream.s_task === undefined)
 				return;
 
 			var taskid = stream.s_task.t_id;
 			if (!agent.ma_tasks.hasOwnProperty(taskid)) {
-				log.fatal('checkTaskCount ' +
+				log.fatal('checkTaskAccounting ' +
 				    'failed: found task "%s" on ' +
 				    'stream "%s" but not in ma_tasks',
 				    taskid, stream.s_id);
@@ -1052,16 +1080,29 @@ mAgent.prototype.checkTaskCount = function ()
 			}
 
 			found[taskid] = true;
+			foundmem += agent.taskGroupMemSlop(group);
+			founddisk += agent.taskGroupDiskSlop(group);
 		});
 	});
 
 	mod_jsprim.forEachKey(agent.ma_tasks, function (taskid) {
 		if (!found.hasOwnProperty(taskid)) {
-			log.fatal('checkTaskCount failed: found task ' +
+			log.fatal('checkTaskAccounting failed: found task ' +
 			    '"%s" on ma_tasks, but not in groups', taskid);
 			process.abort();
 		}
 	});
+
+	if (foundmem != this.ma_slopmem_wanted ||
+	    founddisk != this.ma_slopdisk_wanted) {
+		log.fatal({
+		    'foundmem': foundmem,
+		    'slopmem_wanted': this.ma_slopmem_wanted,
+		    'founddisk': founddisk,
+		    'slopdisk_wanted': this.ma_slopdisk_wanted
+		}, 'checkTaskAccounting failed: slop accounting mismatch');
+		process.abort();
+	}
 };
 
 
@@ -1395,18 +1436,35 @@ mAgent.prototype.taskGroupDiskSlop = function (group)
 
 
 /*
- * Invoked when we discover a new task for a group.  This just enqueues it in
- * the task group.  Streams will pick up queued tasks as zones become available.
- * We also poke the scheduler, since this may have changed our shares.
+ * Invoked when we discover a new task for a group.  This enqueues the task in
+ * the task group, updates the global slop accounting, and pokes the scheduler.
+ * Streams will pick up queued tasks as zones become available.
  */
 mAgent.prototype.taskGroupAppendTask = function (group, task)
 {
 	group.g_log.debug('appending task "%s"', task.t_id);
-	task.t_group = group;
-	group.g_tasks.push(task);
 	this.ma_dtrace.fire('task-enqueued',
 	    function () { return ([ group.g_jobid, task.t_id,
 	        task.t_record['value'] ]); });
+
+	task.t_group = group;
+	group.g_tasks.push(task);
+
+	/*
+	 * If the group already has a "phase" record, then update the global
+	 * memory and disk slop contention counters to reflect the new demand
+	 * for memory and disk slop.  If it doesn't have a "phase" record
+	 * already, then we'll take care of this when we've fetched the job
+	 * record.
+	 */
+	if (group.g_phase) {
+		this.ma_slopmem_wanted += this.taskGroupMemSlop(group);
+		this.ma_slopdisk_wanted += this.taskGroupDiskSlop(group);
+	}
+
+	/*
+	 * Poke the scheduler, since this group's share count may have changed.
+	 */
 	this.schedGroup(group);
 };
 
@@ -1435,6 +1493,16 @@ mAgent.prototype.taskGroupSetJob = function (group, job)
 	    job.j_record['value']['options']['frequentCheckpoint'];
 	group.g_poolid = this.imageLookup(group.g_phase['image']);
 	group.g_domainid = job.j_record['value']['worker'];
+
+	/*
+	 * For any tasks that are already enqueued, now that we know how much
+	 * slop memory and disk are required for each one, update the global
+	 * amounts of memory and slop that are wanted.
+	 */
+	this.ma_slopmem_wanted += this.taskGroupMemSlop(group) *
+	    group.g_tasks.length;
+	this.ma_slopdisk_wanted += this.taskGroupDiskSlop(group) *
+	    group.g_tasks.length;
 
 	if (group.g_poolid === null) {
 		group.g_log.warn(maNoImageError['message']);
@@ -2003,11 +2071,26 @@ mAgent.prototype.taskAsyncDone = function (task)
  */
 mAgent.prototype.taskRemove = function (task)
 {
+	var group;
+
 	this.ma_log.debug('task "%s": removing', task.t_id);
 	mod_assert.ok(task.t_stream === undefined);
 
 	delete (this.ma_tasks[task.t_id]);
 	this.ma_ntasks--;
+
+	/*
+	 * If this task was contributing to the global contention for memory or
+	 * disk slop, update those global contention counters now.  If the group
+	 * has no "phase" field, then we had never gotten the job record for
+	 * this group, and so we had never included this task in those counters
+	 * in the first place.
+	 */
+	group = task.t_group;
+	if (group.g_phase) {
+		this.ma_slopmem_wanted -= this.taskGroupMemSlop(group);
+		this.ma_slopdisk_wanted -= this.taskGroupDiskSlop(group);
+	}
 };
 
 /*
@@ -2283,7 +2366,7 @@ mAgent.prototype.schedHogKill = function (group, timestamp)
  */
 mAgent.prototype.schedGroupShare = function (group)
 {
-	var ntasks, capacity, nzones;
+	var ntasks, pct, capacity, nzones;
 
 	/*
 	 * The number of running tasks (g_nrunning) is almost the same as the
@@ -2292,32 +2375,81 @@ mAgent.prototype.schedGroupShare = function (group)
 	 * case we would double-count it here.  We also don't want to count idle
 	 * streams.
 	 */
-	ntasks = group.g_nrunning + group.g_tasks.length;
-	mod_assert.ok(ntasks <= this.ma_ntasks);
-	if (ntasks === 0)
+	ntasks = this.schedGroupShareNtasks(group);
+	if (ntasks === 0) {
 		return (0);
+	}
 
+	pct = Math.min(
+	    this.schedGroupShareConcurrency(group, ntasks),
+	    this.schedGroupShareMemory(group, ntasks),
+	    this.schedGroupShareDisk(group, ntasks));
+	mod_assert.ok(pct >= 0 && pct <= 1);
 	capacity = this.ma_zonepools[group.g_poolid].unreservedCapacity();
-	nzones = Math.floor(capacity * (ntasks / this.ma_ntasks));
+	nzones = Math.floor(capacity * pct);
 	return (Math.min(ntasks, Math.max(1, nzones)));
+};
+
+mAgent.prototype.schedGroupShareNtasks = function (group)
+{
+	/*
+	 * The number of running tasks (g_nrunning) is almost the same as the
+	 * number of streams (g_nstreams), but during initialization the task
+	 * that will be run on some stream may still be on g_tasks, in which
+	 * case we would double-count it here.  We also don't want to count idle
+	 * streams.
+	 */
+	return (group.g_nrunning + group.g_tasks.length);
+};
+
+mAgent.prototype.schedGroupShareConcurrency = function (group, ntasks)
+{
+	mod_assert.ok(ntasks <= this.ma_ntasks);
+	if (ntasks === 0) {
+		return (0);
+	}
+
+	return (ntasks / this.ma_ntasks);
+};
+
+mAgent.prototype.schedGroupShareMemory = function (group, ntasks)
+{
+	var memwanted;
+
+	memwanted = ntasks * this.taskGroupMemSlop(group);
+	mod_assert.ok(memwanted <= this.ma_slopmem_wanted);
+	if (memwanted === 0) {
+		return (1);
+	}
+
+	return (memwanted / this.ma_slopmem_wanted);
+};
+
+mAgent.prototype.schedGroupShareDisk = function (group, ntasks)
+{
+	var diskwanted;
+
+	diskwanted = ntasks * this.taskGroupMemSlop(group);
+	mod_assert.ok(diskwanted <= this.ma_slopdisk_wanted);
+	if (diskwanted === 0) {
+		return (1);
+	}
+
+	return (diskwanted / this.ma_slopdisk_wanted);
 };
 
 /*
  * Determines how many zones the given task group should give up because it has
- * been allocated more zones than we now want it to have.  In general, we only
- * consider a group overscheduled if zones are in contention; if nobody else has
- * work to do, there's no reason to take zones away from a group.
+ * been allocated more zones than we now want it to have.
  */
 mAgent.prototype.schedGroupOversched = function (group)
 {
-	var ntasks, pool, capacity, nzones;
+	var pool, capacity;
+	var ngrouptasks;
+	var nothertasks, pctother, notherzones;
 
-	/*
-	 * If there's no work to do on the whole system, then nobody's
-	 * overscheduled.  (See above.)
-	 */
-	if (this.ma_ntasks === 0)
-		return (0);
+	ngrouptasks = group.g_nrunning + group.g_tasks.length;
+	nothertasks = this.ma_tasks - ngrouptasks;
 
 	/*
 	 * Since we allow groups to have idle zones when the system is
@@ -2328,18 +2460,70 @@ mAgent.prototype.schedGroupOversched = function (group)
 	 * unless it has more zones than whatever's left over when all other
 	 * groups' minimums are met.
 	 *
+	 * First, compute overscheduling from the perspective of each of our
+	 * three resources: concurrency, memory, and disk.  Each of these helper
+	 * functions returns the percentage of available zones that should be
+	 * assigned to other taskgroups from the perspective of that resource,
+	 * so we take the max of these to figure out an overall number.
+	 */
+	pctother = Math.max(
+	    this.schedGroupOverschedConcurrency(group, ngrouptasks),
+	    this.schedGroupOverschedMemory(group, ngrouptasks),
+	    this.schedGroupOverschedDisk(group, ngrouptasks));
+
+	/*
+	 * Now, multiply that percentage by the pool's unreserved capacity to
+	 * compute the number of zones that should be allocated to other groups.
+	 * That can never be more than total number of tasks assigned to other
+	 * groups.
+	 */
+	pool = this.ma_zonepools[group.g_poolid];
+	capacity = pool.unreservedCapacity();
+	notherzones = Math.min(nothertasks, Math.ceil(capacity * pctother));
+
+	/*
 	 * In order to avoid two equal-share groups thrashing over the last of
 	 * an odd number of zones, you actually have to be more than one zone
 	 * over your share to be considered overscheduled.
 	 */
-	ntasks = this.ma_ntasks - (group.g_nrunning + group.g_tasks.length);
-	mod_assert.ok(ntasks >= 0 && ntasks <= this.ma_ntasks);
+	return (Math.max(0, group.g_nstreams - 1 - (capacity - notherzones)));
+};
 
-	pool = this.ma_zonepools[group.g_poolid];
-	capacity = pool.unreservedCapacity();
-	nzones = Math.min(ntasks,
-	    Math.ceil(capacity * (ntasks / this.ma_ntasks)));
-	return (Math.max(0, group.g_nstreams - 1 - (capacity - nzones)));
+mAgent.prototype.schedGroupOverschedConcurrency = function (group, ngrouptasks)
+{
+	return (this.schedGroupOverschedResource(group, ngrouptasks,
+	    this.ma_ntasks, 1));
+};
+
+mAgent.prototype.schedGroupOverschedMemory = function (group, ngrouptasks)
+{
+	return (this.schedGroupOverschedResource(group, ngrouptasks,
+	    this.ma_slopmem_wanted, this.taskGroupMemSlop(group)));
+};
+
+mAgent.prototype.schedGroupOverschedDisk = function (group, ngrouptasks)
+{
+	return (this.schedGroupOverschedResource(group, ngrouptasks,
+	    this.ma_slopdisk_wanted, this.taskGroupDiskSlop(group)));
+};
+
+mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
+    ntotalwanted, pertask)
+{
+	var notherwanted;
+
+	/*
+	 * If nobody else is using this resource, then there's no reason to take
+	 * zones away from any group because of this resource.
+	 */
+	if (ntotalwanted === 0) {
+		return (0);
+	}
+
+	notherwanted = ntotalwanted - ngrouptasks * pertask;
+	mod_assert.ok(notherwanted >= 0);
+	mod_assert.ok(notherwanted <= ntotalwanted);
+	return (notherwanted / ntotalwanted);
 };
 
 /*
@@ -2357,6 +2541,7 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 {
 	var agent = this;
 	var pool = this.ma_zonepools[poolid];
+	var slopwaiting = [];
 	var startedfull, queue, zone, group;
 
 	startedfull = pool.saturated();
@@ -2364,26 +2549,32 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 
 	while (pool.hasZoneReady() && queue.length > 0) {
 		group = queue.shift();
-		mod_assert.equal(group.g_state,
-		    maTaskGroup.TASKGROUP_S_QUEUED);
+		mod_assert.equal(group.g_state, maTaskGroup.TASKGROUP_S_QUEUED);
 
-		if (agent.taskGroupMemSlop(group) >
-		    agent.availMemSlop()) {
-			group.g_state = maTaskGroup.TASKGROUP_S_INIT;
-			agent.taskGroupError(group, maNoMemError);
-			continue;
-		}
-
-		if (agent.taskGroupDiskSlop(group) >
-		    agent.availDiskSlop()) {
-			group.g_state = maTaskGroup.TASKGROUP_S_INIT;
-			agent.taskGroupError(group, maNoDiskError);
+		if (agent.taskGroupMemSlop(group) > agent.availMemSlop() ||
+		    agent.taskGroupDiskSlop(group) > agent.availDiskSlop()) {
+			group.g_log.info({
+			    'memwanted': agent.taskGroupMemSlop(group),
+			    'memavail': agent.availMemSlop(),
+			    'diskwanted': agent.taskGroupDiskSlop(group),
+			    'diskavail': agent.availDiskSlop()
+			}, 'would schedule group, but out of slop');
+			slopwaiting.push(group);
 			continue;
 		}
 
 		group.g_state = maTaskGroup.TASKGROUP_S_RUNNING;
 		zone = agent.ma_zones[pool.zonePick()];
 		agent.schedDispatch(group, zone);
+	}
+
+	/*
+	 * If anything was ready to run, but we had no slop to run it, throw it
+	 * back on the queue for next time.
+	 */
+	while (slopwaiting.length > 0) {
+		group = slopwaiting.shift();
+		queue.push(group);
 	}
 
 	while (!pool.saturated()) {
@@ -4307,6 +4498,18 @@ maTaskGroup.TASKGROUP_S_RUNNING = 'running';
 
 maTaskGroup.prototype.kangState = function (agent)
 {
+	var ntasks, share, sharec, sharem, shared;
+
+	if (this.g_poolid) {
+		ntasks = agent.schedGroupShareNtasks(this);
+		share = agent.schedGroupShare(this);
+		sharec = agent.schedGroupShareConcurrency(this, ntasks);
+		sharem = agent.schedGroupShareMemory(this, ntasks);
+		shared = agent.schedGroupShareDisk(this, ntasks);
+	} else {
+		share = sharec = sharem = shared = 'n/a';
+	}
+
 	return ({
 	    'groupid': this.g_groupid,
 	    'jobid': this.g_jobid,
@@ -4321,7 +4524,10 @@ maTaskGroup.prototype.kangState = function (agent)
 	    'nstreams': this.g_nstreams,
 	    'nidle': this.g_idle.length,
 	    'hog': this.g_hog,
-	    'share': this.g_poolid ? agent.schedGroupShare(this) : 'n/a'
+	    'share': share,
+	    'shareConcurrency': sharec,
+	    'shareMemory': sharem,
+	    'shareDisk': shared
 	});
 };
 
@@ -4695,8 +4901,10 @@ function maKangGetObject(type, id)
 		    'nTasks': agent.ma_ntasks,
 		    'slopDiskTotal': agent.ma_slopdisk,
 		    'slopDiskUsed': agent.ma_slopdisk_used,
+		    'slopDiskWanted': agent.ma_slopdisk_wanted,
 		    'slopMemTotal': agent.ma_slopmem,
 		    'slopMemUsed': agent.ma_slopmem_used,
+		    'slopMemWanted': agent.ma_slopmem_wanted,
 		    'images': agent.ma_images_byvers.map(
 		         function (u) { return (agent.ma_images[u]); })
 		});
