@@ -301,6 +301,16 @@ var maNoImageError = {
     'message': 'failed to dispatch task: requested image is not available'
 };
 
+var maNoMemError = {
+    'code': EM_TASKINIT,
+    'message': 'failed to dispatch task: not enough memory available'
+};
+
+var maNoDiskError = {
+    'code': EM_TASKINIT,
+    'message': 'failed to dispatch task: not enough disk space available'
+};
+
 var maKilledError = {
     'code': EM_TASKKILLED,
     'message': 'task killed (excessive resource usage)'
@@ -2543,6 +2553,7 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 	var pool = this.ma_zonepools[poolid];
 	var slopwaiting = [];
 	var startedfull, queue, zone, group;
+	var memwanted, diskwanted;
 
 	startedfull = pool.saturated();
 	queue = agent.ma_taskgroups_queued[poolid];
@@ -2551,14 +2562,40 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 		group = queue.shift();
 		mod_assert.equal(group.g_state, maTaskGroup.TASKGROUP_S_QUEUED);
 
-		if (agent.taskGroupMemSlop(group) > agent.availMemSlop() ||
-		    agent.taskGroupDiskSlop(group) > agent.availDiskSlop()) {
-			group.g_log.info({
-			    'memwanted': agent.taskGroupMemSlop(group),
-			    'memavail': agent.availMemSlop(),
-			    'diskwanted': agent.taskGroupDiskSlop(group),
-			    'diskavail': agent.availDiskSlop()
-			}, 'would schedule group, but out of slop');
+		memwanted = agent.taskGroupMemSlop(group);
+		diskwanted = agent.taskGroupDiskSlop(group);
+
+		if (memwanted > agent.ma_slopmem) {
+			/*
+			 * This task group can never be satisfied on this
+			 * system.  This generally indicates a misconfiguration
+			 * between what users are allowed to request for slop
+			 * and what can be provided by the system.
+			 */
+			group.g_state = maTaskGroup.TASKGROUP_S_INIT;
+			agent.taskGroupError(group, maNoMemError);
+			continue;
+		}
+
+		if (diskwanted > agent.ma_slopdisk) {
+			/* See above. */
+			group.g_state = maTaskGroup.TASKGROUP_S_INIT;
+			agent.taskGroupError(group, maNoDiskError);
+			continue;
+		}
+
+		if (memwanted > agent.availMemSlop() ||
+		    diskwanted > agent.availDiskSlop()) {
+			if (!agent.ma_logthrottle.throttle(sprintf(
+			    'group %s', group.g_id)) {
+				group.g_log.info({
+				    'memwanted': memwanted,
+				    'memavail': agent.availMemSlop(),
+				    'diskwanted': diskwanted,
+				    'diskavail': agent.availDiskSlop()
+				}, 'would schedule group, but out of slop');
+			}
+			group.g_nschedfails++;
 			slopwaiting.push(group);
 			continue;
 		}
@@ -4476,6 +4513,8 @@ function maTaskGroup(groupid, job, pi, log)
 	this.g_tasks = [];		/* queue of tasks to be run */
 	this.g_hog = undefined;		/* time since started hogging */
 	this.g_hog_last = undefined;	/* last time we stole a zone */
+	this.g_nschedfails = 0;		/* times we tried to schedule  */
+					/* first zone but had no slop */
 }
 
 /*
