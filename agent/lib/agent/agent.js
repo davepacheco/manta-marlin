@@ -2429,7 +2429,7 @@ mAgent.prototype.schedGroupShareDisk = function (group, ntasks)
 {
 	var diskwanted;
 
-	diskwanted = ntasks * this.taskGroupMemSlop(group);
+	diskwanted = ntasks * this.taskGroupDiskSlop(group);
 	mod_assert.ok(diskwanted <= this.ma_slopdisk_wanted);
 	if (diskwanted === 0) {
 		return (1);
