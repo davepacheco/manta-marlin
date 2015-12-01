@@ -2587,12 +2587,13 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 		if (memwanted > agent.availMemSlop() ||
 		    diskwanted > agent.availDiskSlop()) {
 			if (!agent.ma_logthrottle.throttle(sprintf(
-			    'group %s', group.g_id)) {
+			    'group %s', group.g_groupid))) {
 				group.g_log.info({
 				    'memwanted': memwanted,
 				    'memavail': agent.availMemSlop(),
 				    'diskwanted': diskwanted,
-				    'diskavail': agent.availDiskSlop()
+				    'diskavail': agent.availDiskSlop(),
+				    'nschedfails': group.g_nschedfails
 				}, 'would schedule group, but out of slop');
 			}
 			group.g_nschedfails++;
