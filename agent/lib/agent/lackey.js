@@ -558,6 +558,7 @@ function mazDoneBatch(batch)
 	    'key': batch['taskInputKeys'][0],
 	    'nkeys': batch['taskInputKeys'].length
 	};
+	var taskid = mazCurrentTask['taskId'];
 
 	mazParentRequest('POST /my/jobs/task/commit', 204,
 	    function (rqcallback) {
@@ -568,8 +569,44 @@ function mazDoneBatch(batch)
 			process.exit(1);
 		}
 
-		if (batch['taskInputDone'] || mazCurrentTask === undefined)
+		/*
+		 * If the batch we just committed represented the last batch,
+		 * then we've nothing else to do here.
+		 */
+		if (batch['taskInputDone']) {
 			return;
+		}
+
+		/*
+		 * It's conceivable, however unlikely, that while our commit
+		 * request was outstanding, the user process failed and we
+		 * either proceeded to complete handling of this task or even
+		 * moved on to another task.  In that case, we don't need to do
+		 * anything else here, but we log this case for debugging.  (It
+		 * would probably better to manage outstanding operations more
+		 * tightly so that it wouldn't be possible for the rest of the
+		 * lackey to move on while this request was outstanding.)
+		 */
+		if (mazCurrentTask === undefined ||
+		    mazCurrentTask['taskId'] != taskid) {
+			mazLog.debug('while intermediate reduce commit ' +
+			    'outstanding, lackey had already moved on from ' +
+			    'task %s', taskid);
+			return;
+		}
+
+		/*
+		 * In the same vein, even if we're still processing the same
+		 * task, it's possible that the user's command exited while that
+		 * request was outstanding.  In that case, as above, we
+		 * shouldn't do anything here except log this case for
+		 * debugging.
+		 */
+		if (mazExecutorResult !== undefined) {
+			mazLog.debug('while intermediate reduce commit ' +
+			    'outstanding, task %s exited early', taskid);
+			return;
+		}
 
 		mazParentRequest('GET /my/jobs/task/task?wait=true', 200,
 		    function (subrequestcallback) {
@@ -579,6 +616,27 @@ function mazDoneBatch(batch)
 			if (suberr) {
 				mazLog.fatal(suberr, 'fatal error on batching');
 				process.exit(1);
+			}
+
+			/*
+			 * The same cases described above apply here (where the
+			 * lackey has moved on because the user command exited
+			 * early).  We take the same action: log these cases and
+			 * do nothing else.
+			 */
+			if (mazCurrentTask === undefined ||
+			    mazCurrentTask['taskId'] != taskid) {
+				mazLog.debug('while intermediate reduce ' +
+				    'fetch outstanding, lackey had already ' +
+				    'moved on from task %s', taskid);
+				return;
+			}
+
+			if (mazExecutorResult !== undefined) {
+				mazLog.debug('while intermediate reduce ' +
+				    'fetch outstanding, task %s exited early',
+				    taskid);
+				return;
 			}
 
 			mazLog.info('next batch', task);
