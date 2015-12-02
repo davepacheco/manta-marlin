@@ -3741,6 +3741,12 @@ mAgent.prototype.zoneRemovePool = function (image)
 	delete (this.ma_zonepools[image]);
 	delete (this.ma_taskgroups_queued[image]);
 	this.ma_images_byvers.splice(i, 1);
+	if (this.ma_image_default == image) {
+		this.ma_log.error({ 'image': image },
+		    'all zones for default image have been removed');
+		this.ma_image_default = null;
+	}
+
 	groups.forEach(function (group) {
 		agent.taskGroupError(group, maNoImageError);
 	});
