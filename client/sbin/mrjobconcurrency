@@ -1,0 +1,377 @@
+#!/usr/bin/env node
+/* vim: set ft=javascript: */
+
+/*
+ * mrjobconcurrency: given a marlin agent log file on stdin and the path to a
+ * file mapping jobids to job names, produce a GNUplot file that will plot each
+ * job's concurrency over time based on the data in the log file.  This is
+ * useful for visualizing Marlin zone allocation.
+ */
+
+var mod_assertplus = require('assert-plus');
+var mod_cmdutil = require('cmdutil');
+var mod_extsprintf = require('extsprintf');
+var mod_fs = require('fs');
+var mod_getopt = require('posix-getopt');
+var mod_jsprim = require('jsprim');
+var mod_lstream = require('lstream');
+var mod_stream = require('stream');
+var mod_util = require('util');
+var mod_vasync = require('vasync');
+var mod_vstream = require('vstream');
+var mod_vstream_json_parser = require('vstream-json-parser');
+var VError = require('verror');
+
+var sprintf = mod_extsprintf.sprintf;
+
+var UUID_STRLEN = 36;
+
+function main()
+{
+	var parser, option, jobsfile;
+	var jobinfo, logreader;
+
+	mod_cmdutil.configure({
+	    'synopses': [ 'JOBS_FILE' ],
+	    'usageMessage': 'Report on zone concurrency based on the ' +
+		'contents of an agent\'s log file.'
+	});
+
+	parser = new mod_getopt.BasicParser('', process.argv);
+	while ((option = parser.getopt()) !== undefined) {
+		switch (option.option) {
+		default:
+			/* error message already emitted. */
+			mod_cmdutil.usage();
+			break;
+		}
+	}
+
+	if (process.argv.length != parser.optind() + 1) {
+		mod_cmdutil.usage();
+	}
+
+	if (process.stdin.isTTY) {
+		mod_cmdutil.warn('warn: reading agent log from tty on stdin');
+	}
+
+	jobsfile = process.argv[parser.optind()];
+
+	mjcLoadJobInfo(jobsfile, function (err, info) {
+		if (err) {
+			mod_cmdutil.fail(err);
+		}
+
+		jobinfo = info;
+		logreader = new mjcLogReader({
+		    'jobs': jobinfo
+		});
+
+		process.stdin.pipe(logreader);
+
+		logreader.on('error', function (err2) {
+			mod_cmdutil.fail(err2);
+		});
+
+		logreader.on('warn', function (context, kind, err2) {
+			mod_cmdutil.warn(err2);
+			console.error('at %s', context.label());
+		});
+
+		logreader.pipe(process.stdout);
+	});
+
+}
+
+/*
+ * Given the path to a file containing rows of the form:
+ *
+ *     jobid   jobName
+ *
+ * read the file, parse the contents, and invoke "callback" with an object
+ * mapping job ids to job objects, each having properties "jobId" and "jobName".
+ */
+function mjcLoadJobInfo(filename, callback)
+{
+	var input, opened, failed;
+	var jobs, lstream;
+
+	input = mod_fs.createReadStream(filename);
+	opened = false;
+	input.on('error', function (err) {
+		mod_assertplus.ok(!failed);
+		failed = true;
+
+		if (!opened) {
+			err = new VError(err, 'open "%s"', filename);
+		} else {
+			err = new VError(err, 'read "%s"', filename);
+		}
+
+		callback(err);
+	});
+
+	input.on('open', function () { opened = true; });
+
+	lstream = new mod_lstream();
+	input.pipe(lstream);
+
+	jobs = {};
+	lstream.on('data', function (line) {
+		var jobid, jobname;
+
+		if (line.length === 0) {
+			/*
+			 * Skip blank lines, which typically appear at the end
+			 * of files.
+			 */
+			return;
+		}
+
+		jobid = line.substr(0, UUID_STRLEN);
+		jobname = line.substr(UUID_STRLEN + 1).trim();
+		jobs[jobid] = {
+		    'jobId': jobid,
+		    'jobName': jobname
+		};
+	});
+
+	lstream.on('end', function () {
+		mod_assertplus.ok(!failed);
+		callback(null, jobs);
+	});
+}
+
+function createOneOffTransform(args)
+{
+	var rv, options;
+
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.func(args.transform, 'args.transform');
+	mod_assertplus.optionalFunc(args.flush, 'args.flush');
+	mod_assertplus.optionalObject(args.streamOptions, 'args.streamOptions');
+
+	options = args.hasOwnProperty('streamOptions') ?
+	    args['streamOptions'] : undefined;
+
+	rv = new mod_stream.Transform(options);
+	rv._transform = args['transform'];
+	if (args.flush) {
+		rv._flush = args['flush'];
+	}
+
+	return (rv);
+}
+
+/*
+ * This LogReader is a Writable stream that accepts data directly from a Marlin
+ * agent log and keeps track of concurrency for each job.  This class just wraps
+ * a pipeline of streams.  The guts are handled in mjcLogRecordReader.
+ */
+function mjcLogReader(args)
+{
+	var self = this;
+	var reader, streams;
+
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.object(args.jobs, 'args.jobs');
+
+	streams = [];
+
+	streams.push(new mod_lstream());
+	streams.push(new mod_vstream_json_parser());
+
+	reader = new mjcLogRecordReader(args);
+	streams.push(reader);
+
+	reader.on('warn', function () {
+		var warnargs = Array.prototype.slice.call(arguments);
+		warnargs.unshift('warn');
+		self.emit.apply(self, warnargs);
+	});
+
+	mod_vstream.PipelineStream.call(this, {
+	    'streams': streams
+	});
+}
+
+mod_util.inherits(mjcLogReader, mod_vstream.PipelineStream);
+
+function mjcLogRecordReader(args)
+{
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.object(args.jobs, 'args.jobs');
+
+	this.mrr_time = null;		/* last seen timestamp */
+	this.mrr_countbyjob = {};	/* list of data points, by job */
+	this.mrr_jobs = args.jobs;	/* jobid -> job details */
+
+	mod_stream.Transform.call(this, {
+	    'objectMode': true
+	});
+	mod_vstream.wrapTransform(this);
+}
+
+mod_util.inherits(mjcLogRecordReader, mod_stream.Transform);
+
+mjcLogRecordReader.prototype._transform = function (entry, _, callback)
+{
+	var time;
+
+	/*
+	 * Our analysis wholly depends on getting log entries in chronological
+	 * order.  It shouldn't be possible for entries to arrive out of order,
+	 * or even missing timestamps, unless the clock went backwards on this
+	 * system.  More likely, if this happened, the user gave us garbage, or
+	 * cat'ed multiple files together in the wrong order, and it's better to
+	 * check for this and report a fatal error than produce garbage.
+	 */
+	if (!entry.hasOwnProperty('time')) {
+		this.fatal(callback, new VError('missing "time" field'));
+		return;
+	}
+
+	time = Date.parse(entry['time']);
+	if (isNaN(time)) {
+		this.fatal(callback, new VError('invalid "time" field'));
+		return;
+	}
+
+	if (this.mrr_time !== null && this.mrr_time > time) {
+		this.fatal(callback,
+		    new VError('records found out of chronological order'));
+		return;
+	}
+
+	this.mrr_time = time;
+
+	if ((entry['msg'] == 'stream terminated' ||
+	    entry['msg'] == 'created stream') &&
+	    this.mrr_jobs.hasOwnProperty(entry['job'])) {
+		this.emitPoint({
+		    'p_time': time,
+		    'p_jobid': entry['job'],
+		    'p_count': entry['group_concurrency']
+		});
+	}
+
+	setImmediate(callback);
+};
+
+mjcLogRecordReader.prototype.fatal = function (func, err)
+{
+	/*
+	 * vsWarn() causes us to emit a useful message to stderr that includes
+	 * information about the input that we're processing.  Emitting 'error'
+	 * causes the pipeline to stop.
+	 */
+	this.vsWarn(err, err.message);
+	this.emit('error', err);
+};
+
+mjcLogRecordReader.prototype.emitPoint = function (point)
+{
+	var points;
+
+	/*
+	 * It would be nice if we could stream our output rather than buffering
+	 * everything, but it's not clear if GNUplot supports interleaved points
+	 * in the way we would need in order to do that.
+	 */
+	if (!this.mrr_countbyjob.hasOwnProperty(point.p_jobid)) {
+		/*
+		 * Insert a point at zero just before the first point we read
+		 * because otherwise GNUplot won't know that the value started
+		 * at zero.
+		 */
+		this.mrr_countbyjob[point.p_jobid] = [ {
+		    'p_time': point.p_time - 1,
+		    'p_jobid': point.p_jobid,
+		    'p_count': 0
+		} ];
+	}
+
+	/*
+	 * If we already have a point for this timestamp, drop that one.  (We'll
+	 * only save the last point for each timestamp.)
+	 */
+	points = this.mrr_countbyjob[point.p_jobid];
+	if (points.length > 0 &&
+	    points[points.length - 1].p_time == point.p_time) {
+		points.pop();
+	}
+
+	points.push(point);
+};
+
+mjcLogRecordReader.prototype._flush = function (callback)
+{
+	var self = this;
+	var seriescmds;
+
+	self.push([
+	    '#',
+	    '# This GNUplot control and data file was generated automatically ',
+	    '# by the "mrjobconcurrency" tool.  You can use it to create a ',
+	    '# graph as a PNG image using:',
+	    '#',
+	    '#     gnuplot < this_file > graph.png',
+	    '#',
+	    '',
+	    'set terminal png size 1200,600',
+	    'set title "Job Concurrency"',
+	    '',
+	    '# Configure plots to use the x-axis as time.',
+	    'set xdata time;',
+	    'set timefmt "%Y-%m-%dT%H:%M:%SZ',
+	    'set format x "%m/%d\\n%H:%M:%.3SZ";',
+	    '',
+	    '# Add 25% padding to the top of the graph.',
+	    'set offsets graph 0, 0, 0.25, 0;',
+	    '',
+	    '# The y-axis should always start at zero.',
+	    'set yrange [0:*]',
+	    'set ylabel "Number of zones"',
+	    'set ytics',
+	    '',
+	    ''
+	].join('\n'));
+
+	/*
+	 * This is going to look pretty odd in the output file, but GNUplot will
+	 * interpret each "-" as "read the next block from stdin".  So we emit
+	 * each of the jobs' "plot" commands in order, _then_ we emit all the
+	 * data blocks in order.
+	 */
+	mod_jsprim.forEachKey(this.mrr_countbyjob, function (jobid) {
+		self.push(sprintf('# Job "%s"\n', jobid));
+	});
+
+	self.push('plot \\\n');
+	seriescmds = [];
+
+	mod_jsprim.forEachKey(this.mrr_countbyjob, function (jobid) {
+		var jobname = self.mrr_jobs[jobid].jobName;
+		if (jobname === '' || jobname == '-')
+			jobname = jobid;
+
+		seriescmds.push(
+		    sprintf('    "-" using 1:2 with steps title %s',
+		    JSON.stringify(jobname)));
+	});
+
+	self.push(seriescmds.join(', \\\n') + '\n');
+
+	mod_jsprim.forEachKey(this.mrr_countbyjob, function (jobid, points) {
+		points.forEach(function (p, i) {
+			self.push(sprintf('\t%s %d\n',
+			    new Date(p.p_time).toISOString(), p.p_count));
+		});
+
+		self.push(sprintf('\te\n'));
+	});
+
+	setImmediate(callback);
+};
+
+main();

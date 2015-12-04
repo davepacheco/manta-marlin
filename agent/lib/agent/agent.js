@@ -2769,9 +2769,11 @@ mAgent.prototype.schedDispatch = function (group, zone)
 	this.ma_slopmem_used += memslop;
 	this.ma_slopdisk_used += diskslop;
 
-	stream.s_log.info('created stream for job "%s" phase %d (memslop %d, ' +
-	    'diskslop %d, group concurrency now %d)', group.g_jobid,
-	    group.g_phasei, memslop, diskslop, group.g_nstreams);
+	stream.s_log.info({
+	    'memslop_used': memslop,
+	    'diskslop_used': diskslop,
+	    'group_concurrency': group.g_nstreams
+	}, 'created stream');
 
 	stream.s_pipeline = mod_vasync.pipeline({
 	    'arg': {
@@ -3295,13 +3297,16 @@ mAgent.prototype.taskStreamCleanup = function (stream)
 	var agent = this;
 	var group, zone;
 
-	stream.s_log.info('stream terminated (state = "%s"), error = ',
-	    stream.s_state, stream.s_error || 'no error');
+	group = stream.s_group;
+	stream.s_log.info({
+	    'state': stream.s_state,
+	    'error': stream.s_error || null,
+	    'group_concurrency': group.g_nstreams - 1
+	}, 'stream terminated');
 	mod_assert.ok(stream.s_task === undefined);
 	stream.s_state = maTaskStream.TASKSTREAM_S_DONE;
 	this.ma_counters['streams_done']++;
 
-	group = stream.s_group;
 	mod_assert.equal(group.g_streams[stream.s_id], stream);
 	delete (group.g_streams[stream.s_id]);
 	if (--group.g_nstreams === 0) {
