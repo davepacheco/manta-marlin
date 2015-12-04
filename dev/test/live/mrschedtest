@@ -1,0 +1,366 @@
+#!/usr/bin/env node
+/* vim: set ft=javascript: */
+
+/*
+ * mrschedtest: run jobs concurrently and try to balance task ratios in order to
+ * test commonscheduler use-cases.
+ */
+
+var mod_assertplus = require('assert-plus');
+var mod_cmdutil = require('cmdutil');
+var mod_getopt = require('posix-getopt');
+var mod_jsprim = require('jsprim');
+var mod_kang = require('kang');
+var mod_manta = require('manta');
+var mod_vasync = require('vasync');
+var VError = require('verror');
+
+var mod_testcommon = require('../../test/common');
+var mod_livetests = require('../../test/live/common');
+
+/*
+ * Canned workloads are defined declaratively here.  All this test runner really
+ * does is launch one or more jobs with a given number of tasks and optionally
+ * delaying before executing each one.  The intent is for these to simulate the
+ * types of workloads we test with the Marlin zone scheduler.  Each workload
+ * below is an array of jobs, each of which has a number of tasks to be
+ * executed.  The optional "delay" property indicates how long to pause before
+ * kicking off this job.
+ */
+var mstConfigs = {
+    'onejob': [ {
+	/* One job that uses the whole system. */
+	'ntasks': 500
+    } ],
+
+    'twojobs': [ {
+	/* Two jobs started simultaneously that share the system. */
+	'ntasks': 500
+    }, {
+	'ntasks': 500
+    } ],
+
+    'threejobs': [ {
+	/* Three jobs started simultaneously that share the system. */
+	'ntasks': 500
+    }, {
+	'ntasks': 500
+    }, {
+	'ntasks': 500
+    } ],
+
+    'twojobs_delay': [ {
+	/*
+	 * One job runs for a while, second job arrives and they should share
+	 * zones.
+	 */
+	'ntasks': 1000
+    }, {
+	'ntasks': 1000,
+	'delay': 10000
+    } ],
+
+    'threejobs_delays': [ {
+	/*
+	 * One job runs for a while, second job arrives, runs for a while, a
+	 * third job arrives, runs for a while, and a fourth small job comes in
+	 * and finishes quickly.
+	 */
+	'taskduration': 3,
+	'ntasks': 1000
+    }, {
+	'ntasks': 1000,
+	'taskduration': 3,
+	'delay': 10000
+    }, {
+	'ntasks': 1000,
+	'taskduration': 3,
+	'delay': 10000
+    }, {
+	'ntasks': 1,
+	'taskduration': 3,
+	'delay': 10000
+    } ],
+
+    'onejob_plusquick': [ {
+	/*
+	 * One job runs for a while, and a second one should be able to start
+	 * (and finish) quickly.
+	 */
+	'ntasks': 1000
+    }, {
+	'ntasks': 1,
+	'delay': 10000
+    } ],
+
+    'twojobs_plusquick': [ {
+	/*
+	 * Two jobs runs for a while, and a third one should be able to start
+	 * (and finish) quickly.
+	 */
+	'ntasks': 1000
+    }, {
+	'ntasks': 1000
+    }, {
+	'ntasks': 1,
+	'delay': 10000
+    } ]
+};
+
+function main()
+{
+	var parser, option;
+	var marlin_url, configname, kangsources;
+	var confconfig, conf, k;
+
+	mod_cmdutil.configure({
+	    'synopses': [ 'MARLIN_URL CONFIG' ],
+	    'usageMessage': 'run jobs according to predefined configurations ' +
+	        'to exercise Marlin scheduler activity'
+	});
+
+	parser = new mod_getopt.BasicParser('', process.argv);
+	while ((option = parser.getopt()) !== undefined) {
+		switch (option.option) {
+		default:
+			/* error message already emitted. */
+			mod_cmdutil.usage();
+			break;
+		}
+	}
+
+	if (process.argv.length != parser.optind() + 2) {
+		mod_cmdutil.usage();
+	}
+
+	marlin_url = process.argv[parser.optind()];
+	try {
+		kangsources = mod_kang.knParseSources(marlin_url);
+		if (kangsources.length != 1) {
+			throw (new Error('expected exactly one source'));
+		}
+	} catch (ex) {
+		mod_cmdutil.warn(ex);
+		mod_cmdutil.usage();
+	}
+
+	conf = {};
+	conf['kangSources'] = kangsources;
+
+	configname = process.argv[parser.optind() + 1];
+	confconfig = mstParseConfig(configname);
+	if (confconfig instanceof Error) {
+		mod_cmdutil.warn(confconfig);
+		mod_cmdutil.usage();
+	}
+	for (k in confconfig) {
+		mod_assertplus.ok(!conf.hasOwnProperty(k));
+		conf[k] = confconfig[k];
+	}
+
+	mstSchedtest(conf, function (err) {
+		if (err) {
+			mod_cmdutil.fail(err);
+		}
+	});
+}
+
+function mstParseConfig(configname)
+{
+	var err, msg;
+
+	if (!mstConfigs.hasOwnProperty(configname)) {
+		msg = '"%s" is not one of the supported configs\n';
+		msg += 'supported configs: %s';
+		err = new VError(msg, configname, Object.keys(mstConfigs).map(
+		    function (c) { return (JSON.stringify(c)); }).join(', '));
+		return (err);
+	}
+
+	return ({
+	    'configName': configname,
+	    'config': mstConfigs[configname]
+	});
+}
+
+function mstSchedtest(args, callback)
+{
+	var stages, state;
+
+	mod_assertplus.object(args, 'args');
+	mod_assertplus.string(args.configName, 'args.configName');
+	mod_assertplus.arrayOfObject(args.config, 'args.config');
+	mod_assertplus.arrayOfObject(args.kangSources, 'args.kangSources');
+
+	stages = [];
+	stages.push(mstSchedtestInit);
+	stages.push(mstSchedtestWaitIdle);
+
+	state = {
+	    'st_nfetches': 0,
+	    'st_sources': args.kangSources,
+	    'st_marlin': null,
+	    'st_name': args.configName,
+	    'st_barrier': mod_vasync.barrier(),
+	    'st_jobslaunched': [],
+	    'st_testoptions': { 'strict': true },
+	    'st_errors': []
+	};
+
+	state.st_barrier.start('not yet waiting for jobs');
+
+	args.config.forEach(function (c) {
+		if (c.hasOwnProperty('delay')) {
+			stages.push(function (_, subcallback) {
+				mstSchedtestDelay(state, c.delay, subcallback);
+			});
+		}
+
+		stages.push(function mstSchedtestLaunch(st, subcallback) {
+			mstSchedtestLaunchJob(st, c, subcallback);
+		});
+	});
+
+	stages.push(mstSchedtestWaitJobs);
+	stages.push(mstSchedtestFini);
+
+	mod_vasync.pipeline({
+	    'arg': state,
+	    'funcs': stages
+	}, callback);
+}
+
+function mstLog()
+{
+	var args = Array.prototype.slice.call(arguments);
+	if (args.length > 0) {
+		args[0] = new Date().toISOString() + ': ' + args[0];
+	}
+
+	console.log.apply(console.log, args);
+}
+
+function mstSchedtestInit(st, callback)
+{
+	mstLog('initializing test suite');
+	mod_testcommon.setup(function (c) {
+		st.st_marlin = c;
+		mstLog('waiting for marlin to quiesce');
+		callback();
+	});
+}
+
+function mstSchedtestWaitIdle(st, callback)
+{
+	var fetchargs = { 'sources': st.st_sources };
+
+	st.st_nfetches++;
+	mod_kang.knFetchAll(fetchargs, function (err, snapshot) {
+		if (err) {
+			callback(err);
+			return;
+		}
+
+		var zones, i, z;
+		var nnotready = 0;
+
+		zones = snapshot.list('zone');
+		for (i = 0; i < zones.length; i++) {
+			z = snapshot.lookup('zone', zones[i])[0];
+			if (z['state'] != 'ready') {
+				nnotready++;
+			}
+		}
+
+		if (zones.length === 0) {
+			callback(new Error('no zones found'));
+		}
+
+		if (nnotready > 0) {
+			mstLog('%d zone%s not ready (%d total zones)',
+			    nnotready, nnotready == 1 ? '' : 's', zones.length);
+			setTimeout(mstSchedtestWaitIdle, 5000, st, callback);
+			return;
+		}
+
+		mstLog('all %d zone%s ready',
+		    zones.length, zones.length == 1 ? '' : 's');
+		callback();
+	});
+}
+
+function mstSchedtestDelay(st, delay, callback)
+{
+	mstLog('delaying %d milliseconds', delay);
+	setTimeout(callback, delay);
+}
+
+function mstSchedtestLaunchJob(st, c, callback)
+{
+	var testcase;
+	var label, i;
+	var input, output;
+	var sleeptime;
+
+	label = 'job ' + st.st_jobslaunched.length;
+	sleeptime = c.taskduration || 1;
+	testcase = {
+	    'label': 'job',
+	    'job': {
+		'phases': [ { 'type': 'map', 'exec': 'sleep ' + sleeptime } ]
+	    },
+	    'inputs': [],
+	    'extra_inputs': [],
+	    'errors': [],
+	    'expected_outputs': [],
+	    'timeout': 600 * 1000
+	};
+
+	input = '/%user%/stor/obj1';
+	output = '/%user%/jobs/.*/stor' + input;
+	testcase['inputs'].push(input);
+	testcase['expected_outputs'].push(new RegExp(output));
+	for (i = 1; i < c.ntasks; i++) {
+		testcase['extra_inputs'].push(input);
+		testcase['expected_outputs'].push(new RegExp(output));
+	}
+
+	st.st_barrier.start(label);
+	st.st_jobslaunched.push(label);
+	mstLog('launching job with %d task%s', c.ntasks,
+	    c.ntasks == 1 ? '' : 's');
+	mod_livetests.jobTestCaseRun(st.st_marlin, testcase, st.st_testoptions,
+	    function (err, jobid) {
+		if (err) {
+			st.st_errors.push(new VError(err, '%s', label));
+		}
+
+		mstLog('job %s %s: done', jobid, label);
+		st.st_barrier.done(label);
+	    });
+
+	/*
+	 * We don't want to wait for this job to finish yet.
+	 */
+	setImmediate(callback);
+}
+
+function mstSchedtestWaitJobs(st, callback)
+{
+	mstLog('waiting for jobs to complete');
+	st.st_barrier.on('drain', function () { callback(); });
+	st.st_barrier.done('not yet waiting for jobs');
+}
+
+function mstSchedtestFini(st, callback)
+{
+	if (st.st_errors.length > 0) {
+		var err = new VError(st.st_errors[0], 'first error');
+		callback(err);
+		return;
+	}
+
+	mod_testcommon.teardown(st.st_marlin, callback);
+}
+
+main();

@@ -121,10 +121,11 @@ JSON_FILES	+= package.json
 JS_DIRS		 = $(COMPONENT_DIRS)
 JS_FILES	:= $(shell find $(JS_DIRS) -name '*.js' 2>/dev/null)
 JS_FILES	+= \
+    agent/sbin/mrjobconcurrency		\
     client/sbin/mrerrorsummary		\
     client/sbin/mrjob			\
-    client/sbin/mrjobconcurrency	\
     client/sbin/mrmeter 		\
+    dev/test/live/mrschedtest		\
     dev/tools/bashstyle			\
     dev/tools/mrpound			\
     jobsupervisor/sbin/mlocate

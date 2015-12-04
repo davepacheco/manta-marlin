@@ -759,7 +759,9 @@ function jobTestVerifyTimeout(api, testspec, jobid, options, callback)
 				err.noRetry = !err.retry;
 			subcallback(err);
 		});
-	    }, callback);
+	    }, function (err) {
+		callback(err, jobid);
+	    });
 }
 
 /*

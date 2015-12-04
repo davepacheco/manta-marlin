@@ -97,10 +97,15 @@ function setup(callback)
 
 	barrier.start('ufds');
 	log.info({ 'url': ufds_url }, 'connecting to ufds');
+	/*
+	 * We'd normally pass a child logger to factories like this, but UFDS
+	 * creates its own logger (whose name we have no control over).
+	 */
 	ufds_client = new mod_sdc.UFDS({
 	    'url': ufds_url,
 	    'bindDN': 'cn=root',
-	    'bindPassword': 'secret'
+	    'bindPassword': 'secret',
+	    'log': log
 	});
 	ufds_client.once('ready', function () {
 		log.info('ufds ready');
