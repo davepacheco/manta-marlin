@@ -2258,7 +2258,7 @@ mAgent.prototype.schedHogsMark = function (poolid, timestamp)
 			agent.taskStreamCleanup(stream);
 		}
 
-		var oversched = agent.schedGroupOversched(group);
+		var oversched = agent.schedGroupOversched(group, 'hogs check');
 		if (group.g_hog === undefined && oversched) {
 			group.g_log.warn('marking group as hog (pool busy)');
 			group.g_hog = timestamp;
@@ -2309,7 +2309,7 @@ mAgent.prototype.schedHogsTick = function (timestamp)
 		 * "steal" interval.
 		 */
 		var count, i;
-		count = Math.min(agent.schedGroupOversched(group),
+		count = Math.min(agent.schedGroupOversched(group, 'hogs kill'),
 		    group.g_idle.length + 1);
 		mod_assert.ok(count > 0);
 		for (i = 0; i < count; i++)
@@ -2452,14 +2452,15 @@ mAgent.prototype.schedGroupShareDisk = function (group, ntasks)
  * Determines how many zones the given task group should give up because it has
  * been allocated more zones than we now want it to have.
  */
-mAgent.prototype.schedGroupOversched = function (group)
+mAgent.prototype.schedGroupOversched = function (group, reason)
 {
 	var pool, capacity;
 	var ngrouptasks;
 	var nothertasks, pctother, notherzones;
+	var pctz, pctm, pctd, rv;
 
 	ngrouptasks = group.g_nrunning + group.g_tasks.length;
-	nothertasks = this.ma_tasks - ngrouptasks;
+	nothertasks = this.ma_ntasks - ngrouptasks;
 
 	/*
 	 * Since we allow groups to have idle zones when the system is
@@ -2476,10 +2477,10 @@ mAgent.prototype.schedGroupOversched = function (group)
 	 * assigned to other taskgroups from the perspective of that resource,
 	 * so we take the max of these to figure out an overall number.
 	 */
-	pctother = Math.max(
-	    this.schedGroupOverschedConcurrency(group, ngrouptasks),
-	    this.schedGroupOverschedMemory(group, ngrouptasks),
-	    this.schedGroupOverschedDisk(group, ngrouptasks));
+	pctz = this.schedGroupOverschedConcurrency(group, ngrouptasks);
+	pctm = this.schedGroupOverschedMemory(group, ngrouptasks);
+	pctd = this.schedGroupOverschedDisk(group, ngrouptasks);
+	pctother = Math.max(pctz, pctm, pctd);
 
 	/*
 	 * Now, multiply that percentage by the pool's unreserved capacity to
@@ -2496,7 +2497,21 @@ mAgent.prototype.schedGroupOversched = function (group)
 	 * an odd number of zones, you actually have to be more than one zone
 	 * over your share to be considered overscheduled.
 	 */
-	return (Math.max(0, group.g_nstreams - 1 - (capacity - notherzones)));
+	rv = Math.max(0, group.g_nstreams - 1 - (capacity - notherzones));
+
+	group.g_log.debug({
+	    'reason': reason,
+	    'count': rv,
+	    'capacity': capacity,
+	    'notherzones': notherzones,
+	    'nothertasks': nothertasks,
+	    'pctz': pctz,
+	    'pctm': pctm,
+	    'pctd': pctd,
+	    'pctother': pctother
+	}, 'group oversched');
+
+	return (rv);
 };
 
 mAgent.prototype.schedGroupOverschedConcurrency = function (group, ngrouptasks)
@@ -3057,7 +3072,7 @@ mAgent.prototype.taskStreamAdvance = function (stream, callback)
 
 	stop = stream.s_error !== undefined ||
 	    this.ma_zones[stream.s_machine].z_quiesced !== undefined ||
-	    this.schedGroupOversched(stream.s_group) > 0;
+	    this.schedGroupOversched(stream.s_group, 'choose') > 0;
 
 	if (stop || stream.s_group.g_tasks.length === 0) {
 		if (stream.s_error &&
