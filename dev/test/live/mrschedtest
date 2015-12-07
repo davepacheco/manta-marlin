@@ -35,9 +35,9 @@ var mstConfigs = {
 
     'twojobs': [ {
 	/* Two jobs started simultaneously that share the system. */
-	'ntasks': 500
+	'ntasks': 1000
     }, {
-	'ntasks': 500
+	'ntasks': 1000
     } ],
 
     'threejobs': [ {
@@ -71,15 +71,15 @@ var mstConfigs = {
     }, {
 	'ntasks': 1000,
 	'taskduration': 3,
-	'delay': 10000
+	'delay': 20000
     }, {
 	'ntasks': 1000,
 	'taskduration': 3,
-	'delay': 10000
+	'delay': 20000
     }, {
 	'ntasks': 1,
 	'taskduration': 3,
-	'delay': 10000
+	'delay': 20000
     } ],
 
     'onejob_plusquick': [ {
