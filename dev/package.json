@@ -23,7 +23,7 @@
 		"httpstream": "0.1.1",
 		"hyprlofs": "0.0.3",
 		"illumos_contract": "1.0.1",
-		"jsprim": "0.5.0",
+		"jsprim": "1.2.2",
 		"kang": "1.0.1",
 		"kstat": "0.5.0",
 		"libmanta": "git+ssh://git@github.com:joyent/node-libmanta.git#master",

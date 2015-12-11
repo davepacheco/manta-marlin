@@ -66,7 +66,6 @@
  */
 
 var mod_assert = require('assert');
-var mod_child = require('child_process');
 var mod_extsprintf = require('extsprintf');
 var mod_fs = require('fs');
 var mod_hyprlofs = require('hyprlofs');
@@ -214,6 +213,7 @@ function maZoneRemove(zone, callback)
 	zone.z_log.info('cleaning up in preparation to remove');
 
 	zone.z_pipeline = mod_vasync.pipeline({
+	    'trackTime': true,
 	    'arg': zone,
 	    'funcs': maZoneStagesCleanup
 	}, function (err) {
@@ -237,10 +237,25 @@ function maZoneMakeReady(zone, callback)
 	zone.z_state = maZone.ZONE_S_UNINIT;
 	zone.z_log.info('beginning transition to "ready" state');
 	zone.z_pipeline = mod_vasync.pipeline({
+	    'trackTime': true,
 	    'arg': zone,
 	    'funcs': maZoneStagesReady
 	}, function (err) {
+		var pipeline, timing;
+
+		pipeline = zone.z_pipeline;
 		zone.z_pipeline = undefined;
+
+		timing = {};
+		timing['stages'] = pipeline.operations.map(function (o) {
+			return ({
+			    'funcname': o['funcname'],
+			    'hrtimeStarted': o['hrtimeStarted'],
+			    'hrtimeElapsed': o['hrtimeElapsed']
+			});
+		});
+		timing['hrtimeStarted'] = pipeline['hrtimeStarted'];
+		timing['hrtimeElapsed'] = pipeline['hrtimeElapsed'];
 
 		if (!err && zone.z_state == maZone.ZONE_S_DISABLED)
 			err = new VError('zone disabled during reset');
@@ -248,13 +263,14 @@ function maZoneMakeReady(zone, callback)
 		if (err) {
 			/* XXX close fd */
 			zone.z_state = maZone.ZONE_S_DISABLED;
-			zone.z_log.warn(err, 'failed to make zone ready');
+			timing['error'] = err;
+			zone.z_log.warn(timing, 'failed to make zone ready');
 			callback(zone, err);
 			return;
 		}
 
 		mod_assert.equal(zone.z_state, maZone.ZONE_S_READY);
-		zone.z_log.info('zone is now "ready"');
+		zone.z_log.info(timing, 'zone is now "ready"');
 		callback(zone);
 	});
 }
