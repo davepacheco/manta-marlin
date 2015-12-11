@@ -540,8 +540,15 @@ function mAgent(filename)
 	    'zones_added': 0,		/* zones added to Marlin */
 	    'zones_readied': 0,		/* zones transitioned to "ready" */
 	    'zones_disabled': 0,	/* zones permanently disabled */
+	    'zones_idle_start': 0,	/* zones that began idling */
+	    'zones_idle_reused': 0,	/* idle zones re-used for same stream */
+	    'zones_idle_reclaimed': 0,	/* idle zones reclaimed */
 	    'mantarq_proxy_sent': 0,	/* requests forwarded to Manta */
-	    'mantarq_proxy_return': 0	/* responses received from Manta */
+	    'mantarq_proxy_return': 0,	/* responses received from Manta */
+
+	    'zones_readying': 0,	/* (gauge) zones being reset */
+	    'zones_updating': 0		/* (gauge) zones being updated */
+					/*         with vmadm */
 	};
 
 	this.ma_requests = {};		/* pending HTTP requests, by req_id */
@@ -2254,6 +2261,7 @@ mAgent.prototype.schedHogsMark = function (poolid, timestamp)
 				continue;
 
 			stream.s_log.info('idle time expired');
+			agent.ma_counters['zones_idle_reclaimed']++;
 			group.g_idle.splice(i--, 1);
 			agent.taskStreamCleanup(stream);
 		}
@@ -2336,6 +2344,7 @@ mAgent.prototype.schedHogKill = function (group, timestamp)
 	 */
 	if (group.g_idle.length > 0) {
 		stream = group.g_idle.shift();
+		this.ma_counters['zones_idle_reclaimed']++;
 		stream.s_idle_start = undefined;
 		stream.s_idle_time = undefined;
 	} else {
@@ -2714,7 +2723,11 @@ mAgent.prototype.schedGroup = function (group)
 	if (group.g_idle.length > 0) {
 		agent = this;
 		stream = group.g_idle.shift();
-		stream.s_log.info('taking idle stream for new task');
+		stream.s_log.info({
+		    'group_concurrency': group.g_nstreams,
+		    'group_nidle': group.g_idle.length
+		}, 'taking idle stream for new task');
+		this.ma_counters['zones_idle_reused']++;
 		stream.s_rqqueue.push(function (callback) {
 			agent.taskStreamAdvance(stream, function () {
 				callback();
@@ -2787,7 +2800,8 @@ mAgent.prototype.schedDispatch = function (group, zone)
 	stream.s_log.info({
 	    'memslop_used': memslop,
 	    'diskslop_used': diskslop,
-	    'group_concurrency': group.g_nstreams
+	    'group_concurrency': group.g_nstreams,
+	    'group_nidle': group.g_idle.length
 	}, 'created stream');
 
 	stream.s_pipeline = mod_vasync.pipeline({
@@ -3290,15 +3304,22 @@ mAgent.prototype.taskStreamIdle = function (stream)
 	    (this.ma_zone_idle_max - this.ma_zone_idle_min) +
 	    this.ma_zone_idle_min);
 
-	stream.s_log.info('stream idle', idletime);
+	stream.s_log.info({
+	    'group_concurrency': group.g_nstreams,
+	    'group_nidle': group.g_idle.length +
+	        idletime === 0 ? 0 : 1
+	}, 'stream idle', idletime);
+
 	if (idletime === 0) {
 		this.taskStreamCleanup(stream);
 		return;
 	}
 
+	this.ma_counters['zones_idle_start']++;
 	stream.s_idle_start = Date.now();
 	stream.s_idle_time = idletime;
 	group.g_idle.push(stream);
+	this.zonesReportCounts();
 };
 
 /*
@@ -3316,7 +3337,8 @@ mAgent.prototype.taskStreamCleanup = function (stream)
 	stream.s_log.info({
 	    'state': stream.s_state,
 	    'error': stream.s_error || null,
-	    'group_concurrency': group.g_nstreams - 1
+	    'group_concurrency': group.g_nstreams - 1,
+	    'group_nidle': group.g_idle.length
 	}, 'stream terminated');
 	mod_assert.ok(stream.s_task === undefined);
 	stream.s_state = maTaskStream.TASKSTREAM_S_DONE;
@@ -3537,6 +3559,57 @@ mAgent.prototype.zonesDiscoverFini = function (err, zones)
 		this.zonesDiscover();
 };
 
+/*
+ * In order to make it easy to build tools for reporting on our scheduler, we
+ * periodically report the counts of:
+ *
+ *     o idle zones (see elsewhere -- these are _not_ zones available for use by
+ *       any job)
+ *
+ *     o zones being reset, which includes
+ *
+ *         o zones going through the "ready" pipeline, which is most of the work
+ *           of halting, rolling back the filesystem, and booting again
+ *
+ *         o zones whose memory or disk allocations are being updated using
+ *           "vmadm"
+ *
+ * We report this whenever we expect these numbers may have changed.  (It's not
+ * critical that this be reported every time they change, nor that they only be
+ * reported when they have changed.)
+ *
+ * A complete picture of the scheduler requires additionally knowing the total
+ * count of zones and the numbers of disabled and reserve zones, and all of
+ * these counters should all be broken out by zone pool.  Since this is
+ * primarily intended for verification in controlled environments, that level of
+ * detail isn't necessary.
+ *
+ * The distinction between the two substates of "resetting" is a rather arcane
+ * implementation detail, and we would be better off refactoring code so that
+ * the "vmadm update" happens as part of the normal zone reset process.
+ * However, since it's easy to provide broken-out counts for these substates
+ * and it's possible that we may want to observe it, we provide counts for these
+ * two substates.
+ */
+mAgent.prototype.zonesReportCounts = function ()
+{
+	var c, nidle, nreadying, nupdating, nresetting;
+
+	c = this.ma_counters;
+	nidle = c['zones_idle_start'] -
+	    (c['zones_idle_reused'] + c['zones_idle_reclaimed']);
+	nreadying = c['zones_readying'];
+	nupdating = c['zones_updating'];
+	nresetting = nreadying + nupdating;
+
+	this.ma_log.info({
+	    'nidle': nidle,
+	    'nresetting': nresetting,
+	    'nupdating': nupdating,
+	    'nreadying': nreadying
+	}, 'current zone states');
+};
+
 mAgent.prototype.zoneReset = function (zone, logpath)
 {
 	mod_assert.equal(zone.z_state, mod_agent_zone.maZone.ZONE_S_BUSY);
@@ -3544,12 +3617,7 @@ mAgent.prototype.zoneReset = function (zone, logpath)
 	var agent = this;
 	var finish, logstream, outstream;
 
-	finish = function () {
-		mod_agent_zone.maZoneMakeReady(zone,
-		    agent.zoneReady.bind(agent));
-		agent.ma_dtrace.fire('zone-reset-start',
-		    function () { return ([ zone.z_zonename ]); });
-	};
+	finish = function () { agent.zoneMakeReady(zone); };
 
 	if (zone.z_quiesced !== undefined) {
 		this.zoneDisable(zone, new VError('zone disabled by operator'));
@@ -3653,14 +3721,25 @@ mAgent.prototype.zoneReleaseSlop = function (zone, oldmem, olddisk)
 	}
 };
 
+mAgent.prototype.zoneMakeReady = function (zone)
+{
+	mod_agent_zone.maZoneMakeReady(zone, this.zoneReadied.bind(this));
+	this.ma_counters['zones_readying']++;
+	this.zonesReportCounts();
+	this.ma_dtrace.fire('zone-reset-start',
+	    function () { return ([ zone.z_zonename ]); });
+};
+
 /*
  * Invoked as a callback when the given zone transitions to the "ready" state
  * (or fails to do so).
  */
-mAgent.prototype.zoneReady = function (zone, err)
+mAgent.prototype.zoneReadied = function (zone, err)
 {
 	var agent = this;
 	var oldmem, olddisk, options;
+
+	this.ma_counters['zones_readying']--;
 
 	this.ma_dtrace.fire('zone-reset-done', function () {
 		return ([ zone.z_zonename, err ? err.message : '' ]);
@@ -3679,10 +3758,15 @@ mAgent.prototype.zoneReady = function (zone, err)
 	}
 
 	mod_assert.equal(zone.z_state, mod_agent_zone.maZone.ZONE_S_READY);
+	this.ma_counters['zones_updating']++;
+	this.zonesReportCounts();
+
 	oldmem = zone.z_options['max_physical_memory'];
 	olddisk = zone.z_options['quota'];
 	options = this.ma_conf['zoneDefaults'];
 	mod_agent_zone.maZoneSet(zone, options, function (suberr) {
+		agent.ma_counters['zones_updating']--;
+
 		if (suberr) {
 			agent.zoneDisable(zone, new VError(suberr,
 			    'failed to set properties'));
@@ -3718,6 +3802,8 @@ mAgent.prototype.zoneReady = function (zone, err)
 			    zone.z_image);
 			agent.schedHogsClear(zone.z_image);
 		}
+
+		agent.zonesReportCounts();
 	});
 };
 
@@ -3732,6 +3818,7 @@ mAgent.prototype.zoneDisable = function (zone, err)
 
 	this.ma_zonepools[zone.z_image].zoneMarkDisabled(zone.z_zonename);
 	this.schedIdle();
+	this.zonesReportCounts();
 };
 
 mAgent.prototype.zoneEnable = function (zone)
@@ -3739,9 +3826,7 @@ mAgent.prototype.zoneEnable = function (zone)
 	mod_assert.equal(zone.z_state, mod_agent_zone.maZone.ZONE_S_DISABLED);
 	zone.z_quiesced = undefined;
 	this.ma_zonepools[zone.z_image].zoneMarkEnabled(zone.z_zonename);
-	mod_agent_zone.maZoneMakeReady(zone, this.zoneReady.bind(this));
-	this.ma_dtrace.fire('zone-reset-start',
-	    function () { return ([ zone.z_zonename ]); });
+	this.zoneMakeReady(zone);
 };
 
 mAgent.prototype.zoneRemovePool = function (image)
@@ -3791,9 +3876,7 @@ mAgent.prototype.zoneAdd = function (zonename, image)
 	this.ma_zones[zonename] = zone;
 	this.ma_counters['zones_added']++;
 	this.ma_zonepools[image].zoneAdd(zonename, zone);
-	mod_agent_zone.maZoneMakeReady(zone, this.zoneReady.bind(this));
-	this.ma_dtrace.fire('zone-reset-start',
-	    function () { return ([ zone.z_zonename ]); });
+	this.zoneMakeReady(zone);
 };
 
 /*

@@ -25,6 +25,7 @@ var VError = require('verror');
 var sprintf = mod_extsprintf.sprintf;
 
 var UUID_STRLEN = 36;
+var showIdleZonesAsAssigned = false;
 
 function main()
 {
@@ -64,7 +65,8 @@ function main()
 
 		jobinfo = info;
 		logreader = new mjcLogReader({
-		    'jobs': jobinfo
+		    'jobs': jobinfo,
+		    'showIdleZonesAsAssigned': showIdleZonesAsAssigned
 		});
 
 		process.stdin.pipe(logreader);
@@ -175,6 +177,8 @@ function mjcLogReader(args)
 
 	mod_assertplus.object(args, 'args');
 	mod_assertplus.object(args.jobs, 'args.jobs');
+	mod_assertplus.bool(args.showIdleZonesAsAssigned,
+	    'args.showIdleZonesAsAssigned');
 
 	streams = [];
 
@@ -201,10 +205,22 @@ function mjcLogRecordReader(args)
 {
 	mod_assertplus.object(args, 'args');
 	mod_assertplus.object(args.jobs, 'args.jobs');
+	mod_assertplus.bool(args.showIdleZonesAsAssigned,
+	    'args.showIdleZonesAsAssigned');
 
 	this.mrr_time = null;		/* last seen timestamp */
-	this.mrr_countbyjob = {};	/* list of data points, by job */
+	this.mrr_countbyseries = {};	/* list of data points, by series */
 	this.mrr_jobs = args.jobs;	/* jobid -> job details */
+	this.mrr_events = {		/* messages to act on */
+	    'stream terminated': true,
+	    'created stream': true
+	};
+	this.mrr_showidle = args.showIdleZonesAsAssigned;
+
+	if (!this.mrr_showidle) {
+		this.mrr_events['stream idle'] = true;
+		this.mrr_events['taking idle stream for new task'] = true;
+	}
 
 	mod_stream.Transform.call(this, {
 	    'objectMode': true
@@ -216,7 +232,7 @@ mod_util.inherits(mjcLogRecordReader, mod_stream.Transform);
 
 mjcLogRecordReader.prototype._transform = function (entry, _, callback)
 {
-	var time;
+	var time, count;
 
 	/*
 	 * Our analysis wholly depends on getting log entries in chronological
@@ -245,13 +261,24 @@ mjcLogRecordReader.prototype._transform = function (entry, _, callback)
 
 	this.mrr_time = time;
 
-	if ((entry['msg'] == 'stream terminated' ||
-	    entry['msg'] == 'created stream') &&
-	    this.mrr_jobs.hasOwnProperty(entry['job'])) {
+	if (entry['msg'] == 'current zone states') {
 		this.emitPoint({
 		    'p_time': time,
-		    'p_jobid': entry['job'],
-		    'p_count': entry['group_concurrency']
+		    'p_series': 'nresetting',
+		    'p_count': entry['nresetting']
+		});
+	} else if (this.mrr_events.hasOwnProperty(entry['msg']) &&
+	    this.mrr_jobs.hasOwnProperty(entry['job'])) {
+		count = entry['group_concurrency'];
+
+		if (!this.mrr_showidle) {
+			count -= entry['group_nidle'];
+		}
+
+		this.emitPoint({
+		    'p_time': time,
+		    'p_series': entry['job'],
+		    'p_count': count
 		});
 	}
 
@@ -278,15 +305,15 @@ mjcLogRecordReader.prototype.emitPoint = function (point)
 	 * everything, but it's not clear if GNUplot supports interleaved points
 	 * in the way we would need in order to do that.
 	 */
-	if (!this.mrr_countbyjob.hasOwnProperty(point.p_jobid)) {
+	if (!this.mrr_countbyseries.hasOwnProperty(point.p_series)) {
 		/*
 		 * Insert a point at zero just before the first point we read
 		 * because otherwise GNUplot won't know that the value started
 		 * at zero.
 		 */
-		this.mrr_countbyjob[point.p_jobid] = [ {
+		this.mrr_countbyseries[point.p_series] = [ {
 		    'p_time': point.p_time - 1,
-		    'p_jobid': point.p_jobid,
+		    'p_series': point.p_series,
 		    'p_count': 0
 		} ];
 	}
@@ -295,7 +322,7 @@ mjcLogRecordReader.prototype.emitPoint = function (point)
 	 * If we already have a point for this timestamp, drop that one.  (We'll
 	 * only save the last point for each timestamp.)
 	 */
-	points = this.mrr_countbyjob[point.p_jobid];
+	points = this.mrr_countbyseries[point.p_series];
 	if (points.length > 0 &&
 	    points[points.length - 1].p_time == point.p_time) {
 		points.pop();
@@ -307,7 +334,7 @@ mjcLogRecordReader.prototype.emitPoint = function (point)
 mjcLogRecordReader.prototype._flush = function (callback)
 {
 	var self = this;
-	var seriescmds;
+	var seriescmds, earliest, latest;
 
 	self.push([
 	    '#',
@@ -342,36 +369,103 @@ mjcLogRecordReader.prototype._flush = function (callback)
 	 * interpret each "-" as "read the next block from stdin".  So we emit
 	 * each of the jobs' "plot" commands in order, _then_ we emit all the
 	 * data blocks in order.
+	 *
+	 * In this pass, we keep track of the earliest and latest data points in
+	 * each of the job series.  We'll prune data points from special series
+	 * to fit within this range.
 	 */
-	mod_jsprim.forEachKey(this.mrr_countbyjob, function (jobid) {
-		self.push(sprintf('# Job "%s"\n', jobid));
-	});
+	earliest = null;
+	latest = null;
+	mod_jsprim.forEachKey(this.mrr_countbyseries,
+	    function (series, points) {
+		self.push(sprintf('# Series "%s"\n', series));
+
+		if (series != 'nresetting') {
+			earliest = earliest === null ?
+			    points[0].p_time :
+			    Math.min(earliest, points[0].p_time);
+			latest = latest === null ?
+			    points[points.length - 1].p_time :
+			    Math.max(latest, points[points.length - 1].p_time);
+		}
+	    });
+
+	/*
+	 * Now, trim our special series to remove data points outside the range.
+	 * (We'll keep up to one data point outside the range on either end to
+	 * frame the graph.)
+	 */
+	if (this.mrr_countbyseries.hasOwnProperty('nresetting')) {
+		var ps, pi;
+
+		ps = this.mrr_countbyseries['nresetting'];
+		for (pi = 0; pi < ps.length; pi++) {
+			if (ps[pi].p_time >= earliest) {
+				break;
+			}
+		}
+
+		if (pi > 0) {
+			ps.splice(0, pi - 1);
+		}
+
+		for (pi = ps.length - 1; pi >= 0; pi--) {
+			if (ps[pi].p_time <= latest) {
+				break;
+			}
+		}
+
+		ps.splice(pi + 2, ps.length - 1 - pi);
+	}
 
 	self.push('plot \\\n');
-	seriescmds = [];
+	seriescmds = [
+	    '    "-" using 1:2 with steps title "zones resetting" linecolor ' +
+	        '"lightgrey"'
+	];
 
-	mod_jsprim.forEachKey(this.mrr_countbyjob, function (jobid) {
-		var jobname = self.mrr_jobs[jobid].jobName;
-		if (jobname === '' || jobname == '-')
-			jobname = jobid;
+	mod_jsprim.forEachKey(this.mrr_countbyseries, function (series) {
+		var seriesname;
+
+		if (series == 'nresetting') {
+			return;
+		}
+
+		seriesname = self.mrr_jobs[series].jobName;
+		if (seriesname === '' || seriesname == '-')
+			seriesname = series;
 
 		seriescmds.push(
 		    sprintf('    "-" using 1:2 with steps title %s',
-		    JSON.stringify(jobname)));
+		    JSON.stringify(seriesname)));
 	});
 
 	self.push(seriescmds.join(', \\\n') + '\n');
 
-	mod_jsprim.forEachKey(this.mrr_countbyjob, function (jobid, points) {
-		points.forEach(function (p, i) {
-			self.push(sprintf('\t%s %d\n',
-			    new Date(p.p_time).toISOString(), p.p_count));
-		});
+	if (this.mrr_countbyseries.hasOwnProperty('nresetting')) {
+		this.dumpOneSeries(this.mrr_countbyseries['nresetting']);
+	}
 
-		self.push(sprintf('\te\n'));
-	});
+	mod_jsprim.forEachKey(this.mrr_countbyseries,
+	    function (series, points) {
+		if (series != 'nresetting') {
+			self.dumpOneSeries(points);
+		}
+	    });
 
 	setImmediate(callback);
+};
+
+mjcLogRecordReader.prototype.dumpOneSeries = function (points)
+{
+	var self = this;
+
+	points.forEach(function (p, i) {
+		self.push(sprintf('\t%s %d\n',
+		    new Date(p.p_time).toISOString(), p.p_count));
+	});
+
+	self.push(sprintf('\te\n'));
 };
 
 main();
