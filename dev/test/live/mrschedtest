@@ -318,7 +318,7 @@ function mstSchedtestLaunchJob(st, c, callback)
 	    'extra_inputs': [],
 	    'errors': [],
 	    'expected_outputs': [],
-	    'timeout': 600 * 1000
+	    'timeout': 1200 * 1000
 	};
 
 	input = '/%user%/stor/obj1';
