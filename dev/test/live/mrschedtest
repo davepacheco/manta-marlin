@@ -35,18 +35,18 @@ var mstConfigs = {
 
     'twojobs': [ {
 	/* Two jobs started simultaneously that share the system. */
-	'ntasks': 2500
+	'ntasks': 1000
     }, {
-	'ntasks': 2500
+	'ntasks': 1000
     } ],
 
     'threejobs': [ {
 	/* Three jobs started simultaneously that share the system. */
-	'ntasks': 5000
+	'ntasks': 1000
     }, {
-	'ntasks': 5000
+	'ntasks': 1000
     }, {
-	'ntasks': 5000
+	'ntasks': 1000
     } ],
 
     'twojobs_delay': [ {
@@ -54,10 +54,10 @@ var mstConfigs = {
 	 * One job runs for a while, second job arrives and they should share
 	 * zones.
 	 */
-	'ntasks': 2500,
+	'ntasks': 1000,
 	'taskduration': 3
     }, {
-	'ntasks': 2500,
+	'ntasks': 1000,
 	'taskduration': 3,
 	'delay': 20000
     } ],
