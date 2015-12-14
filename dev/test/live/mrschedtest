@@ -15,8 +15,9 @@ var mod_manta = require('manta');
 var mod_vasync = require('vasync');
 var VError = require('verror');
 
-var mod_testcommon = require('../../test/common');
-var mod_livetests = require('../../test/live/common');
+var mod_testcommon = require('../common');
+var mod_livetests = require('./common');
+var mod_schema = require('../../lib/schema');
 
 /*
  * Canned workloads are defined declaratively here.  All this test runner really
@@ -27,7 +28,7 @@ var mod_livetests = require('../../test/live/common');
  * executed.  The optional "delay" property indicates how long to pause before
  * kicking off this job.
  */
-var mstConfigs = {
+var mstWorkloads = {
     'onejob': [ {
 	/* One job that uses the whole system. */
 	'ntasks': 500
@@ -109,24 +110,141 @@ var mstConfigs = {
 	'ntasks': 1,
 	'delay': 10000,
 	'taskduration': 3
+    } ],
+
+/*
+ * Slop-related jobs test similar combinations, but where the shares end up
+ * being determined by slop counts rather than number of tasks.  In these test
+ * cases, "slop" is an integer representing relative ratios of slop used per
+ * task.
+ */
+    'slop_sharing_same_ratios': [ {
+	/*
+	 * This test case uses different numbers of tasks, but the same amount
+	 * of slop per task, so that the resulting sharing ends up being the
+	 * same as if slop were not a factor.
+	 */
+	'ntasks': 1000,
+	'slop': 1
+    }, {
+	'ntasks': 2000,
+	'slop': 1
+    } ],
+
+    'slop_sharing_different_ratios': [ {
+	/*
+	 * This test case uses different numbers of both tasks and slop so that
+	 * the resulting sharing should be 50/25 instead of 33/67 or 50/50.
+	 * (The first job is bound by its concurrency share, while the second is
+	 * bound by its slop share.)
+	 */
+	'ntasks': 1000,
+	'slop': 3
+    }, {
+	'ntasks': 3000,
+	'slop': 1
+    } ],
+
+    'slop_plusquick': [ {
+	/*
+	 * This case demonstrates (1) that jobs using slop burst to a maximum
+	 * number of zones, and (2) that when another job arrives that doesn't
+	 * need slop, it can run immediately in another zone.
+	 */
+	'ntasks': 1000,
+	'slop': 1
+    }, {
+	'delay': 10000,
+	'ntasks': 1
+    } ],
+
+    'slop_plusquickslop': [ {
+	/*
+	 * This case is like the previous case, but the one-task job also
+	 * requires slop.  That will trigger one zone reset, after which that
+	 * job will run immediately.  (This is a major functional difference
+	 * from pre-slop-aware zone scheduling.  Before, the second job would
+	 * have failed.)
+	 */
+	'ntasks': 1000,
+	'slop': 1
+    }, {
+	'delay': 10000,
+	'ntasks': 1,
+	'slop': 1
+    } ],
+
+    'slop_delay_slop': [ {
+	/*
+	 * This case demonstrates what happens when one job uses all available
+	 * slop, then a second job arrives that wants to use just as much slop.
+	 * This is one of the core scheduler test cases, but adding slop as a
+	 * dimension to the problem.  Like the previous test case, this case
+	 * exercises a major difference from pre-slop-aware scheduling, and this
+	 * case was really the motivator for the whole project.
+	 */
+	'ntasks': 1500,
+	'slop': 1
+    }, {
+	'delay': 10000,
+	'ntasks': 1000,
+	'slop': 1
     } ]
 };
+
+/*
+ * For each kind of slop ("disk" and "memory"), we need to know:
+ *
+ *    zeroSlopAmount		The amount of this resource that all tasks get
+ *    				before any slop memory is used.  For example,
+ *    				if zeroSlopAmount = 8 (e.g., 8GB, the default
+ *    				for "disk"), then a task asking for 8GB of disk
+ *    				would use no slop and a task asking for 24GB of
+ *    				disk would use 16GB of slop.
+ *
+ *    jobValues			List of values for this resource that can be
+ *    				requested by end users when submitting jobs.
+ *    				These are used to validate that a desired slop
+ *    				value can be satisfied.  For example, if we
+ *    				decide to run a job that consumes 24GB of disk
+ *    				slop pool, we must add "zeroSlopAmount" to
+ *    				figure out what we'll have to request in our job
+ *    				in order to use that much slop (in this case,
+ *    				32GB).  If that's not one of these values, then
+ *    				there's no way for us to satisfy this test case.
+ */
+var mstSlopKinds = {
+    'disk': {
+	'zeroSlopAmount': 8,	/* XXX should come from agent config */
+	'jobValues': mod_schema.sDiskOptions
+    },
+    'memory': {
+	'zeroSlopAmount': 512,	/* XXX should come from agent config */
+	'jobValues': mod_schema.sMemoryOptions
+    }
+};
+
 
 function main()
 {
 	var parser, option;
-	var marlin_url, configname, kangsources;
-	var confconfig, conf, k;
+	var wname, marlin_url, kangsources;
+	var err, conf;
+	var slopkind = 'disk';
 
 	mod_cmdutil.configure({
-	    'synopses': [ 'MARLIN_URL CONFIG' ],
-	    'usageMessage': 'run jobs according to predefined configurations ' +
+	    'synopses': [ 'MARLIN_URL WORKLOAD_NAME' ],
+	    'usageMessage': 'run jobs according to predefined workloads ' +
 	        'to exercise Marlin scheduler activity'
 	});
 
-	parser = new mod_getopt.BasicParser('', process.argv);
+	parser = new mod_getopt.BasicParser('s:(slop-resource)', process.argv);
 	while ((option = parser.getopt()) !== undefined) {
 		switch (option.option) {
+		case 's':
+			slopkind = option.optarg;
+			break;
+
 		default:
 			/* error message already emitted. */
 			mod_cmdutil.usage();
@@ -139,6 +257,8 @@ function main()
 	}
 
 	marlin_url = process.argv[parser.optind()];
+	wname = process.argv[parser.optind() + 1];
+
 	try {
 		kangsources = mod_kang.knParseSources(marlin_url);
 		if (kangsources.length != 1) {
@@ -150,42 +270,178 @@ function main()
 	}
 
 	conf = {};
+	conf['slopKind'] = slopkind;
 	conf['kangSources'] = kangsources;
+	conf['workloadName'] = wname;
 
-	configname = process.argv[parser.optind() + 1];
-	confconfig = mstParseConfig(configname);
-	if (confconfig instanceof Error) {
-		mod_cmdutil.warn(confconfig);
+	err = mstParseSlopkind(conf);
+	if (err instanceof Error) {
+		mod_cmdutil.warn(err);
 		mod_cmdutil.usage();
 	}
-	for (k in confconfig) {
-		mod_assertplus.ok(!conf.hasOwnProperty(k));
-		conf[k] = confconfig[k];
+
+	err = mstParseWorkload(conf);
+	if (err instanceof Error) {
+		mod_cmdutil.warn(err);
+		mod_cmdutil.usage();
 	}
 
-	mstSchedtest(conf, function (err) {
-		if (err) {
-			mod_cmdutil.fail(err);
+	mstSchedtest(conf, function (err2) {
+		if (err2) {
+			mod_cmdutil.fail(err2);
 		}
 	});
 }
 
-function mstParseConfig(configname)
+/*
+ * Given the partially-initialized configuration having at least property:
+ *
+ *     slopKind		either "disk" or "memory"
+ *
+ * populate the following properties into the config:
+ *
+ *     slopBaseValue		the amount of the slop resource that's provided
+ *     				to all zones without requiring any resources
+ *     				from the slop pool
+ *
+ *     slopUnit			the number of units of slop represented by each
+ *     				unit described in a test case.  For example, if
+ *     				the "slop" for a test case is N, then the amount
+ *     				of slop actually used for that testcase is N *
+ *     				slopUnit, and the amount of that resource that
+ *     				needs to be requested in order to use that much
+ *     				slop is N * slopUnit + slopBaseValue.
+ *
+ *     slopResourceValues	list of values that end users may specify for
+ *     				the slop resource
+ *
+ * On success, this function returns null.  On error, returns an Error object.
+ * Errors include when "slopKind" is not one of its supported values, or when no
+ * test cases using slop can be run at all based on the current configuration.
+ */
+function mstParseSlopkind(conf)
 {
-	var err, msg;
+	var slopkind, slopcfg, slopunit, baseamt, validvalues, i;
 
-	if (!mstConfigs.hasOwnProperty(configname)) {
-		msg = '"%s" is not one of the supported configs\n';
-		msg += 'supported configs: %s';
-		err = new VError(msg, configname, Object.keys(mstConfigs).map(
+	/*
+	 * For convenience, test cases are defined in terms of slop ratios: the
+	 * test case may specify that one task has "slop" 1, while another has
+	 * "slop" 2, but that only means that the second task uses twice as much
+	 * slop as the first.  Eventually, we need to translate these values
+	 * into an actual amount of resources to request.  That calculation must
+	 * take into account the amount of that resource that each zone gets
+	 * that does _not_ come out of the slop pool.  For example, if every
+	 * zone gets 512MB of memory, and the options for requesting memory are
+	 * [512MB, 1024MB, 2048MB], then the slop used by each of these options
+	 * is [0MB, 512MB, 1536MB], respectively.  In this case, the minimum
+	 * amount of slop that can be used is 512MB, and to use that, we'd
+	 * request 1024MB of memory.  Note that with such a configuration, the
+	 * only slop multipliers we can support are "1" and "3" -- "2" is not
+	 * possible because there's no amount of memory that we can ask for that
+	 * will use 1024MB of slop, or 2x the base unit.
+	 *
+	 * If this sounds annoying to calculate, remember: that's precisely why
+	 * we encapsulate that calculation here, instead of requiring the user
+	 * to deal with all that as part of specifying the test cases.
+	 */
+	slopkind = conf['slopKind'];
+	if (!mstSlopKinds.hasOwnProperty(slopkind)) {
+		return (new VError(
+		    'unsupported slop resource: "%s"', slopkind));
+	}
+
+	slopcfg = mstSlopKinds[slopkind];
+	baseamt = slopcfg['zeroSlopAmount'];
+	validvalues = slopcfg['jobValues'];
+
+	for (i = 0; i < validvalues.length; i++) {
+		if (validvalues[i] > baseamt) {
+			break;
+		}
+	}
+
+	if (i == validvalues.length) {
+		return (new VError('cannot run slop test cases: the ' +
+		    'default value for "%s" ("%s") exceeds all allowed ' +
+		    'user-specified values', conf['slopKind'], baseamt));
+	}
+
+	slopunit = validvalues[i] - baseamt;
+	mod_assertplus.ok(slopunit > 0);
+
+	conf['slopBaseValue'] = baseamt;
+	conf['slopResourceValues'] = validvalues;
+	conf['slopUnit'] = slopunit;
+	return (null);
+}
+
+/*
+ * Given the partially initialized configuration having at least properties:
+ *
+ *     workloadName		name of one of the predefined workloads
+ *     				(specified above)
+ *
+ *     slopBaseValue,		see mstParseSlopkind()
+ *     slopResourceValues,
+ *     slopUnit
+ *
+ * populate the workload-specific properties:
+ *
+ *     workload			the workload itself (structure described above)
+ *
+ * Returns null on success, or an Error on failure.  Failures include
+ * "workloadName" does not refer to a supported workload, or that the workload
+ * definition is incompatible with the current slop configuration.
+ */
+function mstParseWorkload(conf)
+{
+	var wname, w;
+	var err, msg, i;
+	var baseamt, validvalues, slopunit;
+
+	mod_assertplus.string(conf['workloadName']);
+	wname = conf['workloadName'];
+	if (!mstWorkloads.hasOwnProperty(wname)) {
+		msg = '"%s" is not one of the supported workloads\n';
+		msg += 'supported workloads: %s';
+		err = new VError(msg, wname, Object.keys(mstWorkloads).map(
 		    function (c) { return (JSON.stringify(c)); }).join(', '));
 		return (err);
 	}
 
-	return ({
-	    'configName': configname,
-	    'config': mstConfigs[configname]
-	});
+	conf['workload'] = w = mstWorkloads[wname];
+
+	/*
+	 * Now that we know which test we're running, make sure that it can be
+	 * satisfied given the current slop configuration.
+	 */
+	baseamt = conf['slopBaseValue'];
+	mod_assertplus.number(baseamt);
+
+	validvalues = conf['slopResourceValues'];
+	mod_assertplus.arrayOfNumber(validvalues);
+
+	slopunit = conf['slopUnit'];
+	mod_assertplus.number(slopunit);
+
+	for (i = 0; i < w.length; i++) {
+		if (!w[i].hasOwnProperty('slop')) {
+			continue;
+		}
+
+		mod_assertplus.number(w[i]['slop']);
+		if (validvalues.indexOf(
+		    baseamt + w[i]['slop'] * slopunit) == -1) {
+			return (new VError('cannot run slop test case "%s": ' +
+			    'entry %d requires slop "%d" (value %d), which ' +
+			    'requires requesting %d, but that is not one of ' +
+			    'the supported values', wname, i + 1, w[i]['slop'],
+			    w[i]['slop'] * slopunit,
+			    w[i]['slop'] * slopunit + baseamt));
+		}
+	}
+
+	return (null);
 }
 
 function mstSchedtest(args, callback)
@@ -193,8 +449,8 @@ function mstSchedtest(args, callback)
 	var stages, state;
 
 	mod_assertplus.object(args, 'args');
-	mod_assertplus.string(args.configName, 'args.configName');
-	mod_assertplus.arrayOfObject(args.config, 'args.config');
+	mod_assertplus.string(args.workloadName, 'args.workloadName');
+	mod_assertplus.arrayOfObject(args.workload, 'args.workload');
 	mod_assertplus.arrayOfObject(args.kangSources, 'args.kangSources');
 
 	stages = [];
@@ -202,19 +458,23 @@ function mstSchedtest(args, callback)
 	stages.push(mstSchedtestWaitIdle);
 
 	state = {
-	    'st_nfetches': 0,
+	    'st_name': args.workloadName,
 	    'st_sources': args.kangSources,
+	    'st_slopresource': args.slopKind,
+	    'st_slopunit': args.slopUnit,
+	    'st_slopbase': args.slopBaseValue,
+	    'st_testoptions': { 'strict': true },
+
 	    'st_marlin': null,
-	    'st_name': args.configName,
+	    'st_nfetches': 0,
 	    'st_barrier': mod_vasync.barrier(),
 	    'st_jobslaunched': [],
-	    'st_testoptions': { 'strict': true },
 	    'st_errors': []
 	};
 
 	state.st_barrier.start('not yet waiting for jobs');
 
-	args.config.forEach(function (c) {
+	args.workload.forEach(function (c) {
 		if (c.hasOwnProperty('delay')) {
 			stages.push(function (_, subcallback) {
 				mstSchedtestDelay(state, c.delay, subcallback);
@@ -320,6 +580,11 @@ function mstSchedtestLaunchJob(st, c, callback)
 	    'expected_outputs': [],
 	    'timeout': 1200 * 1000
 	};
+
+	if (c.hasOwnProperty('slop')) {
+		testcase['job']['phases'][0][st.st_slopresource] =
+		    st.st_slopbase + st.st_slopunit * c['slop'];
+	}
 
 	input = '/%user%/stor/obj1';
 	output = '/%user%/jobs/.*/stor' + input;

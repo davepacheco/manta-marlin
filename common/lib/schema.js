@@ -910,3 +910,6 @@ exports.sPercentRequired = sPercentRequired;
 exports.sStringRequired = sStringRequired;
 exports.sStringRequiredNonEmpty = sStringRequiredNonEmpty;
 exports.sTcpPortRequired = sTcpPortRequired;
+
+exports.sMemoryOptions = sMemory['enum'].slice(0);
+exports.sDiskOptions = sDisk['enum'].slice(0);
