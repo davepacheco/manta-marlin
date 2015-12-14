@@ -392,8 +392,8 @@ mjcLogRecordReader.prototype._flush = function (callback)
 
 	/*
 	 * Now, trim our special series to remove data points outside the range.
-	 * (We'll keep up to one data point outside the range on either end to
-	 * frame the graph.)
+	 * We'll keep up to one data point on each end of the range in order to
+	 * frame the graph.
 	 */
 	if (this.mrr_countbyseries.hasOwnProperty('nresetting')) {
 		var ps, pi;
@@ -406,7 +406,18 @@ mjcLogRecordReader.prototype._flush = function (callback)
 		}
 
 		if (pi > 0) {
+			/*
+			 * Remove all but one data points in this series that
+			 * are earlier than the earliest data points in all
+			 * other series.  Additionally, we rewrite the timestamp
+			 * of the remaining first data point to appear just
+			 * before the earliest data point.  This is valid
+			 * because the quantities here are discrete, and a
+			 * reported value at time "t" remains the value from [t,
+			 * t1), where "t1" is the time of the next data point.
+			 */
 			ps.splice(0, pi - 1);
+			ps[0].p_time = earliest - 1;
 		}
 
 		for (pi = ps.length - 1; pi >= 0; pi--) {

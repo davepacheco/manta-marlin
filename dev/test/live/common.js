@@ -867,7 +867,7 @@ function jobTestVerifyFetchOutputs(verify, callback)
 function jobTestVerifyFetchOutputContent(verify, callback)
 {
 	var manta = verify['api'].manta;
-	var concurrency = 15;
+	var concurrency = 10;
 	var errors = [];
 	var queue;
 
