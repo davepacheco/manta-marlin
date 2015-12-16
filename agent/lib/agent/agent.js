@@ -572,12 +572,15 @@ function mAgent(filename)
 	 * Memory management: we maintain a slop pool of DRAM, configured as a
 	 * percentage of total physical memory on the system.  Memory from this
 	 * pool is allocated to zones whose tasks request it (by specifying the
-	 * "memory" property on the job phase).
+	 * "memory" property on the job phase).  Groups needing memory slop and
+	 * having no zones are queued onto ma_slopmem_groups for use in
+	 * scheduling decisions.  See schedGroupOversched().
 	 */
 	var pct = this.ma_conf['tunables']['zoneMemorySlopPercent'] / 100;
 	this.ma_slopmem = Math.floor(pct * mod_os.totalmem() / 1024 / 1024);
 	this.ma_slopmem_used = 0;
 	this.ma_slopmem_wanted = 0;	/* total amount of memory slop wanted */
+	this.ma_slopmem_groups = {};	/* groups waiting for slop */
 
 	/*
 	 * Disk space management: we take a similar approach for managing disk
@@ -587,6 +590,7 @@ function mAgent(filename)
 	this.ma_slopdisk = 0;
 	this.ma_slopdisk_used = 0;
 	this.ma_slopdisk_wanted = 0;	/* total amount of disk slop wanted */
+	this.ma_slopdisk_groups = {};	/* groups waiting for slop */
 }
 
 /*
@@ -2465,8 +2469,8 @@ mAgent.prototype.schedGroupOversched = function (group, reason)
 {
 	var pool, capacity;
 	var ngrouptasks;
-	var nothertasks, pctother, notherzones;
-	var pctz, pctm, pctd, rv;
+	var nothertasks, notherzones;
+	var limiter, pctz, pctm, pctd, rv;
 
 	ngrouptasks = group.g_nrunning + group.g_tasks.length;
 	nothertasks = this.ma_ntasks - ngrouptasks;
@@ -2489,35 +2493,49 @@ mAgent.prototype.schedGroupOversched = function (group, reason)
 	pctz = this.schedGroupOverschedConcurrency(group, ngrouptasks);
 	pctm = this.schedGroupOverschedMemory(group, ngrouptasks);
 	pctd = this.schedGroupOverschedDisk(group, ngrouptasks);
-	pctother = Math.max(pctz, pctm, pctd);
 
 	/*
-	 * Now, multiply that percentage by the pool's unreserved capacity to
-	 * compute the number of zones that should be allocated to other groups.
-	 * That can never be more than total number of tasks assigned to other
-	 * groups.
+	 * Disk and memory limiters take precedence because their calculations
+	 * are necessary to preserve fairness for tiny jobs.  For concurrency
+	 * limiters, the reserve zones serve that purpose.
 	 */
-	pool = this.ma_zonepools[group.g_poolid];
-	capacity = pool.unreservedCapacity();
-	notherzones = Math.min(nothertasks, Math.ceil(capacity * pctother));
+	if (pctm > 0 && pctm >= pctz && pctm >= pctd) {
+		limiter = 'pctm';
+		rv = this.schedGroupOverschedSlopResource(group, 'memory');
+	} else if (pctd > 0 && pctd >= pctm && pctd >= pctz) {
+		limiter = 'pctd';
+		rv = this.schedGroupOverschedSlopResource(group, 'disk');
+	} else {
+		/*
+		 * This group is bound by its concurrency share.  Multiply the
+		 * percentage above by the pool's unreserved capacity to compute
+		 * the number of zones that should be allocated to other groups.
+		 * That can never be more than total number of tasks assigned to
+		 * other groups.
+		 */
+		limiter = 'pctz';
+		pool = this.ma_zonepools[group.g_poolid];
+		capacity = pool.unreservedCapacity();
+		notherzones = Math.min(nothertasks, Math.ceil(capacity * pctz));
 
-	/*
-	 * In order to avoid two equal-share groups thrashing over the last of
-	 * an odd number of zones, you actually have to be more than one zone
-	 * over your share to be considered overscheduled.
-	 */
-	rv = Math.max(0, group.g_nstreams - 1 - (capacity - notherzones));
+		/*
+		 * In order to avoid N equal-share groups thrashing over the
+		 * last of an odd number of zones, you actually have to be more
+		 * than one zone over your share to be considered overscheduled.
+		 */
+		rv = Math.max(0,
+		    group.g_nstreams - 1 - (capacity - notherzones));
+	}
 
 	group.g_log.debug({
 	    'reason': reason,
 	    'count': rv,
+	    'limiter': limiter,
 	    'capacity': capacity,
-	    'notherzones': notherzones,
 	    'nothertasks': nothertasks,
 	    'pctz': pctz,
 	    'pctm': pctm,
-	    'pctd': pctd,
-	    'pctother': pctother
+	    'pctd': pctd
 	}, 'group oversched');
 
 	return (rv);
@@ -2541,6 +2559,13 @@ mAgent.prototype.schedGroupOverschedDisk = function (group, ngrouptasks)
 	    this.ma_slopdisk_wanted, this.taskGroupDiskSlop(group)));
 };
 
+/*
+ * schedGroupOverschedResource() uses a relatively cheap calculation to figure
+ * whether the given task group is using more than its share.  If we decide that
+ * it's using more of its slop share (of either disk or memory), we'll use a
+ * more expensive approach to figure out by how much the group is overscheduled.
+ * See schedGroupOverschedSlopResource().
+ */
 mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
     ntotalwanted, pertask)
 {
@@ -2548,9 +2573,11 @@ mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
 
 	/*
 	 * If nobody else is using this resource, then there's no reason to take
-	 * zones away from any group because of this resource.
+	 * zones away from any group because of this resource.  Similarly, if
+	 * we're not using this resource, there's no point in taking away any
+	 * zones from this group.
 	 */
-	if (ntotalwanted === 0) {
+	if (ntotalwanted === 0 || ngrouptasks === 0 || pertask === 0) {
 		return (0);
 	}
 
@@ -2558,6 +2585,127 @@ mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
 	mod_assert.ok(notherwanted >= 0);
 	mod_assert.ok(notherwanted <= ntotalwanted);
 	return (notherwanted / ntotalwanted);
+};
+
+/*
+ * schedGroupOverschedSlopResource() is used when we've already determined
+ * (based on the return value of schedGroupOverschedResource()) that a group is
+ * overscheduled and we want to figure out how many zones it should return.
+ * As the name implies, this is only used for slop resources (disk and memory).
+ * If a group is overscheduled purely based on its zone share, it's easy to
+ * figure out by how much, and that's taken care of directly in
+ * schedGroupOversched().
+ *
+ * Computing overscheduling in this case is more complicated.  The group is
+ * really overscheduled by an amount of _memory_, not zones, but ultimately we
+ * need to decide how many zones that corresponds to.  The conversion ratio is
+ * not fixed, but rather determined by the amount of slop memory needed by the
+ * other jobs that this job is starving out.
+ *
+ * As an example, suppose:
+ *
+ *     (1) The system has 50GB of slop memory and 200 zones.
+ *
+ *     (2) Each stream in this task group "A" requires 1GB of slop memory, and
+ *         this stream has 50 of those zones.  Assume this task group has a very
+ *         large number of tasks, so that it's share of both zones and slop is
+ *         very high -- nearly 100% of both.  (It will still be limited to 50
+ *         zones because of the limit on slop available.)
+ *
+ *     (3) Now suppose a second group "B" comes along needing 5GB of slop memory
+ *         for each stream, but which has very few tasks.  As a result, its
+ *         share of both zones and slop memory is nearly zero.
+ *
+ * For both liveness and fairness, the desired behavior is for group B to be
+ * allocated one zone.  It's a tiny percentage of all shares, so it shouldn't
+ * get more than one, but it shouldn't be blocked indefinitely by group A.
+ *
+ * If we just look at shares, group A continues to get all 50 zones because in
+ * terms of both concurrency and memory, group B's shares (as a fraction of
+ * available zones) add up to less than one zone.  Note that this is a problem
+ * even without involving slop in the example, but without the slop constraint,
+ * group B would be assigned one of the reserve zones, so it works out anyway.
+ * We don't have a reserve slop, though, and it's not clear that would be a good
+ * way to deal with this problem anyway.  (Sizing such a pool would be much more
+ * complicated than sizing the zone reserve pool, since different groups need
+ * different amounts of slop just to get started.)
+ *
+ * To address this, we take the following (relatively) simple approach: we keep
+ * track of task groups that need slop resources AND that currently have no
+ * zones.  When it comes time to deciding whether a group is overscheduled
+ * that's using slop resources, we examine those groups.  The goal is to give up
+ * enough zones so that at least one of those groups can start running.  To
+ * calculate that, we need to see how much slop memory one of those groups
+ * needs, and then figure out how many of our own zones we'd have to give up to
+ * make that much memory available.
+ */
+mAgent.prototype.schedGroupOverschedSlopResource = function (group, which)
+{
+	var maxgroup, ogroups;
+	var slopForGroup, slopForMaxGroup;
+	var nzonesneeded, nzonesdelta;
+	var agent = this;
+
+	mod_assert.ok(which == 'memory' || which == 'disk');
+
+	if (which == 'disk') {
+		ogroups = this.ma_slopdisk_groups;
+		slopForGroup = this.taskGroupDiskSlop(group);
+	} else {
+		ogroups = this.ma_slopmem_groups;
+		slopForGroup = this.taskGroupMemSlop(group);
+	}
+
+	mod_assert.equal(typeof (slopForGroup), 'number');
+	mod_assert.ok(slopForGroup > 0);
+
+	/*
+	 * Currently, we examine all groups and take the max.  This errs on the
+	 * side of taking away more zones from big-share groups in order to
+	 * satisfy small-share, large-slop-using groups.  Another problem with
+	 * this approach is that multiple large-share groups may together
+	 * sacrifice zones than necessary for a small-share group, the result
+	 * being more zone resets than necessary.  However, this approach makes
+	 * it much more likely that we will eventually be able to satisfy groups
+	 * needing a lot of slop per stream, which is important to preserve
+	 * liveness.
+	 */
+	maxgroup = null;
+	mod_jsprim.forEachKey(ogroups, function (ogid) {
+		var ogroup, slopForOgroup;
+
+		ogroup = agent.ma_taskgroups[ogid];
+		mod_assert.ok(ogroup);
+
+		if (which == 'disk') {
+			slopForOgroup = agent.taskGroupDiskSlop(ogroup);
+		} else {
+			slopForOgroup = agent.taskGroupMemSlop(ogroup);
+		}
+
+		if (maxgroup === null || slopForOgroup > slopForMaxGroup) {
+			maxgroup = ogroup;
+			slopForMaxGroup = slopForOgroup;
+		}
+	});
+
+	if (maxgroup === null) {
+		return (0);
+	}
+
+	nzonesneeded = Math.ceil(slopForMaxGroup / slopForGroup);
+	nzonesdelta = Math.max(0, Math.min(nzonesneeded, group.g_nstreams - 1));
+
+	/*
+	 * To avoid multiple groups from each giving up a bunch of zones to the
+	 * same non-running group for this case, remove the non-running group
+	 * from the list of groups we scanned above.  If for whatever reason
+	 * this group doesn't get scheduled into these zones (e.g., because
+	 * these zones get applied to some other group), we'll eventually
+	 * re-insert the group into this structure.
+	 */
+	delete (ogroups[maxgroup.g_groupid]);
+	return (nzonesdelta);
 };
 
 /*
@@ -2577,7 +2725,7 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 	var pool = this.ma_zonepools[poolid];
 	var slopwaiting = [];
 	var startedfull, queue, zone, group;
-	var memwanted, diskwanted;
+	var memwanted, diskwanted, oomem, oodisk;
 
 	startedfull = pool.saturated();
 	queue = agent.ma_taskgroups_queued[poolid];
@@ -2608,10 +2756,12 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 			continue;
 		}
 
-		if (memwanted > agent.availMemSlop() ||
-		    diskwanted > agent.availDiskSlop()) {
+		oomem = (memwanted > agent.availMemSlop());
+		oodisk = (diskwanted > agent.availDiskSlop());
+
+		if (oomem || oodisk) {
 			if (!agent.ma_logthrottle.throttle(sprintf(
-			    'group %s', group.g_groupid))) {
+			    'group %s out of slop', group.g_groupid))) {
 				group.g_log.info({
 				    'memwanted': memwanted,
 				    'memavail': agent.availMemSlop(),
@@ -2620,6 +2770,16 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 				    'nschedfails': group.g_nschedfails
 				}, 'would schedule group, but out of slop');
 			}
+
+			if (oomem) {
+				agent.ma_slopmem_groups[group.g_groupid] = true;
+			}
+
+			if (oodisk) {
+				agent.ma_slopdisk_groups[
+				    group.g_groupid] = true;
+			}
+
 			group.g_nschedfails++;
 			slopwaiting.push(group);
 			continue;
@@ -2775,9 +2935,11 @@ mAgent.prototype.schedDispatch = function (group, zone)
 
 	memslop = this.taskGroupMemSlop(group);
 	mod_assert.ok(memslop <= this.availMemSlop());
+	delete (this.ma_slopmem_groups[group.g_groupid]);
 
 	diskslop = this.taskGroupDiskSlop(group);
 	mod_assert.ok(diskslop <= this.availDiskSlop());
+	delete (this.ma_slopdisk_groups[group.g_groupid]);
 
 	streamid = group.g_groupid + '/' + zone.z_zonename;
 	stream = new maTaskStream(this, streamid, group, zone.z_zonename);
