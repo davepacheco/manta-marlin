@@ -2695,16 +2695,6 @@ mAgent.prototype.schedGroupOverschedSlopResource = function (group, which)
 
 	nzonesneeded = Math.ceil(slopForMaxGroup / slopForGroup);
 	nzonesdelta = Math.max(0, Math.min(nzonesneeded, group.g_nstreams - 1));
-
-	/*
-	 * To avoid multiple groups from each giving up a bunch of zones to the
-	 * same non-running group for this case, remove the non-running group
-	 * from the list of groups we scanned above.  If for whatever reason
-	 * this group doesn't get scheduled into these zones (e.g., because
-	 * these zones get applied to some other group), we'll eventually
-	 * re-insert the group into this structure.
-	 */
-	delete (ogroups[maxgroup.g_groupid]);
 	return (nzonesdelta);
 };
 
