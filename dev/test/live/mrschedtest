@@ -566,43 +566,27 @@ function mstSchedtestWaitIdle(st, callback)
 			return;
 		}
 
-		var zones, i, z, stats;
-		var nnotready = 0;
-		var nupdating = null;
-
-		zones = snapshot.list('zone');
-		for (i = 0; i < zones.length; i++) {
-			z = snapshot.lookup('zone', zones[i])[0];
-			if (z['state'] != 'ready') {
-				nnotready++;
-			}
-		}
-
-		if (zones.length === 0) {
-			callback(new Error('no zones found'));
-			return;
-		}
+		var stats, nnotready, nupdating;
 
 		stats = snapshot.list('stats');
 		if (stats.length === 0) {
-			callback(new Error('expected stats on zones_updating'));
+			callback(new Error('expected stats'));
 			return;
 		}
 
 		stats = snapshot.lookupFirst('stats', stats[0]);
 		nupdating = stats['zones_updating'];
+		nnotready = stats['zones_readying'];
 
 		if (nnotready > 0 || nupdating > 0) {
 			mstLog(
-			    '%d zone%s not ready, %d updating (%d total zones)',
-			    nnotready, nnotready == 1 ? '' : 's',
-			    nupdating, zones.length);
+			    '%d zone%s not ready, %d updating',
+			    nnotready, nnotready == 1 ? '' : 's', nupdating);
 			setTimeout(mstSchedtestWaitIdle, 5000, st, callback);
 			return;
 		}
 
-		mstLog('all %d zone%s ready',
-		    zones.length, zones.length == 1 ? '' : 's');
+		mstLog('all zones ready');
 		callback();
 	});
 }
