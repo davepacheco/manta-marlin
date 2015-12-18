@@ -8,10 +8,13 @@
 
 var mod_assertplus = require('assert-plus');
 var mod_cmdutil = require('cmdutil');
+var mod_fs = require('fs');
 var mod_getopt = require('posix-getopt');
 var mod_jsprim = require('jsprim');
 var mod_kang = require('kang');
 var mod_manta = require('manta');
+var mod_mkdirp = require('mkdirp');
+var mod_path = require('path');
 var mod_vasync = require('vasync');
 var VError = require('verror');
 
@@ -124,10 +127,10 @@ var mstWorkloads = {
 	 * of slop per task, so that the resulting sharing ends up being the
 	 * same as if slop were not a factor.
 	 */
-	'ntasks': 1000,
+	'ntasks': 500,
 	'slop': 1
     }, {
-	'ntasks': 2000,
+	'ntasks': 1000,
 	'slop': 1
     } ],
 
@@ -138,10 +141,12 @@ var mstWorkloads = {
 	 * (The first job is bound by its concurrency share, while the second is
 	 * bound by its slop share.)
 	 */
-	'ntasks': 1000,
+	'ntasks': 300,
+	'sleep': 3,
 	'slop': 3
     }, {
-	'ntasks': 3000,
+	'ntasks': 900,
+	'sleep': 3,
 	'slop': 1
     } ],
 
@@ -183,11 +188,11 @@ var mstWorkloads = {
 	 * exercises a major difference from pre-slop-aware scheduling, and this
 	 * case was really the motivator for the whole project.
 	 */
-	'ntasks': 1500,
+	'ntasks': 1000,
 	'slop': 1
     }, {
 	'delay': 10000,
-	'ntasks': 1000,
+	'ntasks': 750,
 	'slop': 1
     } ]
 };
@@ -229,11 +234,11 @@ function main()
 {
 	var parser, option;
 	var wname, marlin_url, kangsources;
-	var err, conf;
+	var err, conf, confs, i;
 	var slopkind = 'disk';
 
 	mod_cmdutil.configure({
-	    'synopses': [ 'MARLIN_URL WORKLOAD_NAME' ],
+	    'synopses': [ 'MARLIN_URL WORKLOAD_NAME...' ],
 	    'usageMessage': 'run jobs according to predefined workloads ' +
 	        'to exercise Marlin scheduler activity'
 	});
@@ -252,12 +257,11 @@ function main()
 		}
 	}
 
-	if (process.argv.length != parser.optind() + 2) {
+	if (process.argv.length < parser.optind() + 2) {
 		mod_cmdutil.usage();
 	}
 
 	marlin_url = process.argv[parser.optind()];
-	wname = process.argv[parser.optind() + 1];
 
 	try {
 		kangsources = mod_kang.knParseSources(marlin_url);
@@ -269,24 +273,33 @@ function main()
 		mod_cmdutil.usage();
 	}
 
-	conf = {};
-	conf['slopKind'] = slopkind;
-	conf['kangSources'] = kangsources;
-	conf['workloadName'] = wname;
+	confs = [];
+	for (i = parser.optind() + 1; i < process.argv.length; i++) {
+		wname = process.argv[i];
+		conf = {};
+		conf['slopKind'] = slopkind;
+		conf['kangSources'] = kangsources;
+		conf['workloadName'] = wname;
 
-	err = mstParseSlopkind(conf);
-	if (err instanceof Error) {
-		mod_cmdutil.warn(err);
-		mod_cmdutil.usage();
+		err = mstParseSlopkind(conf);
+		if (err instanceof Error) {
+			mod_cmdutil.warn(new VError(err, 'workload %d', i));
+			mod_cmdutil.usage();
+		}
+
+		err = mstParseWorkload(conf);
+		if (err instanceof Error) {
+			mod_cmdutil.warn(new VError(err, 'workload %d', i));
+			mod_cmdutil.usage();
+		}
+
+		confs.push(conf);
 	}
 
-	err = mstParseWorkload(conf);
-	if (err instanceof Error) {
-		mod_cmdutil.warn(err);
-		mod_cmdutil.usage();
-	}
-
-	mstSchedtest(conf, function (err2) {
+	mod_vasync.forEachPipeline({
+	    'inputs': confs,
+	    'func': mstSchedtest
+	}, function (err2) {
 		if (err2) {
 			mod_cmdutil.fail(err2);
 		}
@@ -446,19 +459,24 @@ function mstParseWorkload(conf)
 
 function mstSchedtest(args, callback)
 {
-	var stages, state;
+	var dirname, stages, state;
 
 	mod_assertplus.object(args, 'args');
 	mod_assertplus.string(args.workloadName, 'args.workloadName');
 	mod_assertplus.arrayOfObject(args.workload, 'args.workload');
 	mod_assertplus.arrayOfObject(args.kangSources, 'args.kangSources');
 
+	dirname = mod_path.join('.',
+	    'mrschedtest-' + args.workloadName + '.' + process.pid);
+
 	stages = [];
 	stages.push(mstSchedtestInit);
+	stages.push(mstSchedtestInitDirs);
 	stages.push(mstSchedtestWaitIdle);
 
 	state = {
 	    'st_name': args.workloadName,
+	    'st_dirname': dirname,
 	    'st_sources': args.kangSources,
 	    'st_slopresource': args.slopKind,
 	    'st_slopunit': args.slopUnit,
@@ -466,6 +484,7 @@ function mstSchedtest(args, callback)
 	    'st_testoptions': { 'strict': true },
 
 	    'st_marlin': null,
+	    'st_jobstxt': null,
 	    'st_nfetches': 0,
 	    'st_barrier': mod_vasync.barrier(),
 	    'st_jobslaunched': [],
@@ -487,6 +506,7 @@ function mstSchedtest(args, callback)
 	});
 
 	stages.push(mstSchedtestWaitJobs);
+	stages.push(mstSchedtestRecordJobs);
 	stages.push(mstSchedtestFini);
 
 	mod_vasync.pipeline({
@@ -507,10 +527,26 @@ function mstLog()
 
 function mstSchedtestInit(st, callback)
 {
-	mstLog('initializing test suite');
+	mstLog('initializing test suite for workload: "%s"', st.st_name);
 	mod_testcommon.setup(function (c) {
 		st.st_marlin = c;
-		mstLog('waiting for marlin to quiesce');
+		callback();
+	});
+}
+
+function mstSchedtestInitDirs(st, callback)
+{
+	mstLog('will put output into "%s"', st.st_dirname);
+	mod_mkdirp(st.st_dirname, function (err) {
+		var file;
+
+		if (err) {
+			callback(new VError(err, 'mkdirp "%s"', st.st_dirname));
+			return;
+		}
+
+		file = mod_path.join(st.st_dirname, 'jobs.txt');
+		st.st_jobstxt = mod_fs.createWriteStream(file);
 		callback();
 	});
 }
@@ -519,6 +555,10 @@ function mstSchedtestWaitIdle(st, callback)
 {
 	var fetchargs = { 'sources': st.st_sources };
 
+	if (st.st_nfetches === 0) {
+		mstLog('waiting for marlin to quiesce');
+	}
+
 	st.st_nfetches++;
 	mod_kang.knFetchAll(fetchargs, function (err, snapshot) {
 		if (err) {
@@ -526,8 +566,9 @@ function mstSchedtestWaitIdle(st, callback)
 			return;
 		}
 
-		var zones, i, z;
+		var zones, i, z, stats;
 		var nnotready = 0;
+		var nupdating = null;
 
 		zones = snapshot.list('zone');
 		for (i = 0; i < zones.length; i++) {
@@ -539,11 +580,23 @@ function mstSchedtestWaitIdle(st, callback)
 
 		if (zones.length === 0) {
 			callback(new Error('no zones found'));
+			return;
 		}
 
-		if (nnotready > 0) {
-			mstLog('%d zone%s not ready (%d total zones)',
-			    nnotready, nnotready == 1 ? '' : 's', zones.length);
+		stats = snapshot.list('stats');
+		if (stats.length === 0) {
+			callback(new Error('expected stats on zones_updating'));
+			return;
+		}
+
+		stats = snapshot.lookupFirst('stats', stats[0]);
+		nupdating = stats['zones_updating'];
+
+		if (nnotready > 0 || nupdating > 0) {
+			mstLog(
+			    '%d zone%s not ready, %d updating (%d total zones)',
+			    nnotready, nnotready == 1 ? '' : 's',
+			    nupdating, zones.length);
 			setTimeout(mstSchedtestWaitIdle, 5000, st, callback);
 			return;
 		}
@@ -605,6 +658,7 @@ function mstSchedtestLaunchJob(st, c, callback)
 			st.st_errors.push(new VError(err, '%s', label));
 		}
 
+		st.st_jobstxt.write(jobid + '\n');
 		mstLog('job %s %s: done', jobid, label);
 		st.st_barrier.done(label);
 	    });
@@ -620,6 +674,15 @@ function mstSchedtestWaitJobs(st, callback)
 	mstLog('waiting for jobs to complete');
 	st.st_barrier.on('drain', function () { callback(); });
 	st.st_barrier.done('not yet waiting for jobs');
+}
+
+function mstSchedtestRecordJobs(st, callback)
+{
+	st.st_jobstxt.on('finish', function () {
+		callback();
+	});
+
+	st.st_jobstxt.end();
 }
 
 function mstSchedtestFini(st, callback)
