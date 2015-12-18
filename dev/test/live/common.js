@@ -867,19 +867,28 @@ function jobTestVerifyFetchOutputs(verify, callback)
 function jobTestVerifyFetchOutputContent(verify, callback)
 {
 	var manta = verify['api'].manta;
-	var concurrency = 10;
+	var concurrency = 15;
 	var errors = [];
 	var queue;
+	var nattempts = 3;
 
 	queue = mod_vasync.queue(
 	    function fetchOneOutputContent(objectpath, qcallback) {
 		log.info('fetching output "%s"', objectpath);
 		manta.get(objectpath, function (err, mantastream) {
 			if (err) {
-				log.warn(err, 'error fetching output "%s"',
-				    objectpath);
-				errors.push(err);
-				qcallback();
+				err = new VError(err,
+				    'fetch job output "%s"', objectpath);
+				if (--nattempts === 0) {
+					log.error(err);
+					errors.push(err);
+					qcallback();
+				} else {
+					log.warn(err, 'retrying');
+					fetchOneOutputContent(
+					    objectpath, qcallback);
+				}
+
 				return;
 			}
 
