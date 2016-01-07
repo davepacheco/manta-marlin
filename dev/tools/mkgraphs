@@ -1,0 +1,50 @@
+#!/bin/bash
+
+#
+# mkgraphs: run mrjobconcurrency on each of the test cases found here.
+#
+
+function fail
+{
+	echo "failed: $@" >&2
+	exit 1
+}
+
+[[ -n "$PROTO" ]] || fail "\$PROTO must be set in the environment."
+[[ -d "$PROTO" ]] || fail "not a directory: \"$PROTO\""
+
+mrjobconcurrency="$PROTO/sbin/mrjobconcurrency"
+logfile="headnode.log"
+
+[[ -x "$mrjobconcurrency" ]] || fail "not executable: \"$mrjobconcurrency\""
+[[ -f "$logfile" ]] || fail "expected $logfile in $(pwd)"
+
+if [[ $# -eq 0 ]]; then
+	fail "must specify directories containing outputs to process"
+fi
+
+failed=false
+for config in "$@"; do
+	if [[ ! -d "$config" ]]; then
+		echo "skipped: $config (not directory)" >&2
+		continue
+	fi
+
+	(
+	cd "$config/.." || fail "failed to cd"
+	config="$(basename $config)"
+
+	echo "$(date): processing \"$config\""
+	workload="${config#*-}"
+	workload="${workload%.*}"
+
+	if ! $mrjobconcurrency $config/jobs.txt < $logfile \
+	    > $config/$workload.gnuplot; then
+		failed=true
+	fi
+	)
+done
+
+if [[ "$failed" != "false" ]]; then
+	fail "error: some jobs failed"
+fi

@@ -60,7 +60,7 @@ variable.
 The standard Marlin development environment is a SmartOS zone deployed on a
 system with a single-system Manta deployed on it.  This is usually COAL or an
 Emeryville lab machine.  In principle, you can develop Marlin on a different
-system from the one where you deploy it, but the existing tools are optimized
+system from the one where you deploy it, but the existing tools are streamlined
 for the single-system case.
 
 If you are using COAL for Marlin development, you may need to increase the
@@ -78,8 +78,8 @@ edit your usb-headnode/build.spec.local:
 
 The usual procedure is:
 
-1. Reflash.  See sdc-headnode.git.
-2. Deploy Manta.  See manta-deployment.git.
+1. [Install SDC](https://github.com/joyent/sdc).
+2. [Deploy Manta](https://github.com/joyent/manta).
 3. Set up your dev zone.  From the global zone, run:
 
     /opt/smartdc/agents/lib/node_modules/cabase/tools/devsetup -t manta dap
@@ -141,7 +141,7 @@ This part's easy:
 
     $ git clone git@github.com:joyent/manta-marlin.git
     $ cd manta-marlin
-    $ . env.sh
+    $ . dev/env.sh
     $ make
     ...
     $ make check
@@ -154,12 +154,13 @@ the Manta tools (mls, mput, etc.)
 
 ## Running the code
 
-There are two main components in Marlin: the worker and the agent.
+There are two main components in Marlin: the jobsupervisor and the agent.
 
-The worker can be run directly out of the repo.  The easiest way to get started
-is to copy the config.json file from an existing Marlin worker deployed on the
-same system, modify the port number (since the default is a privileged port),
-**disable the worker whose configuration you copied**, and then run:
+The jobsupervisor can be run directly out of the repo.  The easiest way to get
+started is to copy the config.json file from an existing Marlin jobsupervisor
+deployed on the same system, modify the port number (since the default is a
+privileged port), **disable the worker whose configuration you copied**, and
+then run:
 
     $ cd manta-marlin
     $ . dev/env.sh
@@ -167,8 +168,8 @@ same system, modify the port number (since the default is a privileged port),
     $ node build/proto/root/opt/smartdc/marlin/lib/worker/server.js \
           ../config.json | tee ../worker.out | bunyan -o short
 
-With this approach, you can apply changes by stopping the worker, running "make
-proto", and starting the worker again.
+With this approach, you can apply changes by stopping the jobsupervisor, running
+"make proto", and starting the jobsupervisor again.
 
 The agent must be run inside the global zone, since it uses other zones to
 actually execute tasks.  To run your own agent, you'll want to run `tools/mru`
@@ -178,7 +179,11 @@ reconfigure the marlin-agent SMF service running in the global zone to execute
 the code in the proto area of your workspace
 (`/zones/$your_dev_zone/root/home/$your_user/marlin/build/proto/root`).  This
 way, you can make changes in your workspace, run "make proto", and simply
-`svcadm restart marlin-agent` to test them out.
+`svcadm restart marlin-agent` to test them out.  Again, this process assumes a
+single-system Manta deployment.  To test on a multi-system deployment, you'll
+want to go through the complete build and upgrade process, which is basically
+"make" in the repo, copy the agent tarball to the target system, and "apm
+install" that tarball.
 
 ## Development tools
 
@@ -222,7 +227,7 @@ state -- see "Running the full test suite" below for details.**
 This environment assumes you set up the environment variables and ssh keys as
 described above.  To run the test suite, just run:
 
-    $ tools/catest -a
+    $ dev/tools/catest -a
 
 You can run individual tests manually with just:
 
@@ -286,6 +291,72 @@ supervisor script because jobs fail if the agent fails too many times while
 they're running.  You must run this from the global zone:
 
     # /zones/$YOUR_ZONE/root/home/$YOUR_USER/marlin/dev/tools/test_agent_kill.sh
+
+
+### Zone scheduler testing
+
+The Marlin agent contains a zone scheduler that is responsible for assigning
+compute zones to job tasks.  The scheduler is described in detail in
+[agent/lib/agent/agent.js](agent/lib/agent/agent.js).  The scheduler does not
+have an automated test suite, but it does have tools to generate basic
+workloads and visualize zone assignments so that you can see what it's done and
+evaluate the behavior.  The tools are:
+
+* [mrschedtest](dev/test/live/mrschedtest): This tool uses the Manta API to
+  launch any of several canned workloads.  These workloads are intended to
+  represent basic scheduler use-cases: single jobs bursting to use all zones,
+  multiple jobs sharing zones fairly, and so on.  You can run multiple workloads
+  sequentially.  mrschedtest uses the agent's monitoring interface (the kang
+  interface) to make sure that the system is quiesced.
+* [mrjobconcurrency](agent/sbin/mrjobconcurrency): This tool examines an agent
+  log file and a file containing a list of jobids to generate a GNUplot file
+  that shows the number of zones assigned to each job over time.
+* [mkgraphs](dev/tools/mkgraphs): This is just a convenience script to run
+  mrjobconcurrency for a bunch of workloads at once.
+
+The typical way to evaluate the scheduler behavior is to:
+
+1. Run all the workloads using `mrschedtest`.  This generates per-workload
+   output directories that will be used later, although all the important data
+   is stored in the agent log file.
+2. Concatenate the agent log files for the entire testing period into one file,
+   in chronological order.
+3. Run `mkgraphs` on the output directories.  This will run "mrjobconcurrency"
+   on each one, using the agent log file as input, and produce GNUplot files.
+4. Run the GNUplot files through gnuplot(1) to visualize zone concurrency.
+
+Let's show these in detail.  First, run the workloads:
+
+    $ mkdir schedtest
+    $ cd schedtest
+    $ nohup ../build/node/bin/node --abort-on-uncaught-exception $PROTO/test/live/mrschedtest KANG_HOST_PORT WORKLOAD_NAMES... > schedtest_all.out &
+
+You'll need to fill in:
+
+* `KANG_HOST_PORT`: this is the IP address and port number where the Marlin
+  agent's kang server is listening.  This is almost always port 9080.  An
+  example value might be "172.27.10.4:9080" (but this depends entirely on your
+  deployment).
+* `WORKLOAD_NAMES...`: these are the workload names supported by "mrschedtest".
+  You can specify any number of these, and they'll be run sequentially.
+
+At present, this process takes about two hours.
+
+Once you've run the workloads, you'll need to concatenate the agent logs for the
+testing period into one file.  Usually you'll need one or two log files that
+were already uploaded to Manta (under
+/poseidon/stor/logs/marlin-agent/YYYY/MM/DD/HH/SERVER\_HOSTNAME.log), plus
+potentially the current agent log file.  Fetch each one you need, then
+concatenate them in order into a file called "headnode.log".
+
+Once you've got the workload output directories plus the agent log file, then
+you can run "mkgraphs" on all of those output directories:
+
+    $ ../dev/tools/mkgraphs mrschedtest-*
+
+This will take a minute or two and produce GNUplot files in each of those
+output directories.  You can run these through gnuplot to visualize zone
+concurrency.
 
 
 # Before pushing changes
