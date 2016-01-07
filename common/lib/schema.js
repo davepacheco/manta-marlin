@@ -903,6 +903,7 @@ exports.sBktConfigs = sBktConfigs;
 exports.sJobStates = sJobStates;
 exports.sMaxReducers = sMaxReducers;
 
+exports.sBoolean = sBoolean;
 exports.sIntervalRequired = sIntervalRequired;
 exports.sNonNegativeInteger = sNonNegativeInteger;
 exports.sNonNegativeIntegerRequired = sNonNegativeIntegerRequired;
