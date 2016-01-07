@@ -2285,7 +2285,8 @@ mAgent.prototype.schedHogsMark = function (poolid, timestamp)
 			agent.taskStreamCleanup(stream);
 		}
 
-		var oversched = agent.schedGroupOversched(group, 'hogs check');
+		var oversched = agent.schedGroupOversched(group, 'hogs check',
+		    false);
 		if (group.g_hog === undefined && oversched) {
 			group.g_log.warn('marking group as hog (pool busy)');
 			group.g_hog = timestamp;
@@ -2337,7 +2338,7 @@ mAgent.prototype.schedHogsTick = function (timestamp)
 		 */
 		var count, i;
 		count = Math.min(agent.schedGroupOversched(group, 'hogs kill'),
-		    group.g_idle.length + 1);
+		    group.g_idle.length + 1, true);
 		mod_assert.ok(count > 0);
 		for (i = 0; i < count; i++)
 			agent.schedHogKill(group, timestamp);
@@ -2502,7 +2503,7 @@ mAgent.prototype.schedGroupShareDisk = function (group, ntasks)
  * overscheduled unless it has more zones than whatever's left over when all
  * other groups' minimums are met.
  */
-mAgent.prototype.schedGroupOversched = function (group, reason)
+mAgent.prototype.schedGroupOversched = function (group, reason, willact)
 {
 	var pool, capacity;
 	var ngrouptasks;
@@ -2535,10 +2536,10 @@ mAgent.prototype.schedGroupOversched = function (group, reason)
 	 */
 	if (pctm > 0 && pctm >= pctz && pctm >= pctd) {
 		limiter = 'pctm';
-		rv = this.schedGroupOverschedSlop(group, 'memory');
+		rv = this.schedGroupOverschedSlop(group, 'memory', willact);
 	} else if (pctd > 0 && pctd >= pctm && pctd >= pctz) {
 		limiter = 'pctd';
-		rv = this.schedGroupOverschedSlop(group, 'disk');
+		rv = this.schedGroupOverschedSlop(group, 'disk', willact);
 	} else {
 		/*
 		 * This group is bound by its concurrency share.  Multiply the
@@ -2706,7 +2707,7 @@ mAgent.prototype.schedGroupOverschedEstimate = function (group, ngrouptasks,
  * needs, and then figure out how many of our own zones we'd have to give up to
  * make that much memory available.
  */
-mAgent.prototype.schedGroupOverschedSlop = function (group, which)
+mAgent.prototype.schedGroupOverschedSlop = function (group, which, willact)
 {
 	var maxgroup, ogroups;
 	var slopForGroup, slopForMaxGroup;
@@ -2731,20 +2732,6 @@ mAgent.prototype.schedGroupOverschedSlop = function (group, which)
 	 * Currently, we examine all groups and take the max.  This errs on the
 	 * side of taking away more zones from big-share groups in order to
 	 * satisfy small-share, large-slop-using groups.
-	 *
-	 * Another problem with this approach is that because this function is
-	 * invoked not just when we're going to take action, but also as part of
-	 * just identifying hogs for possible future action, we cannot assumem
-	 * here that the zones we pick out _will_ be given up.  As a result, we
-	 * cannot actually remove the group from "ogroups".  As a result,
-	 * multiple large jobs may end up giving up zones to the same small job.
-	 * In fact, the same large job can end up giving up more zones than it
-	 * should, if this check is repeated while the zone is still being
-	 * reset.  The result of this is more zone resets than necessary, and
-	 * less concurrency than ideal for the larger groups, but it does make
-	 * it more likely that we will eventually be able to satisfy groups
-	 * needing a lot of slop per stream, which is important to preserve
-	 * liveness.
 	 */
 	maxgroup = null;
 	mod_jsprim.forEachKey(ogroups, function (ogid) {
@@ -2771,6 +2758,23 @@ mAgent.prototype.schedGroupOverschedSlop = function (group, which)
 
 	nzonesneeded = Math.ceil(slopForMaxGroup / slopForGroup);
 	nzonesdelta = Math.max(0, Math.min(nzonesneeded, group.g_nstreams - 1));
+
+	/*
+	 * The "willact" parameter indicates whether the caller intends to act
+	 * on the information we're returning.  If so, then once we find one of
+	 * these groups, we remove it from "ogroups".  This avoids having
+	 * multiple jobs (or even one job) shed too many zones for the same job
+	 * when the job only needs a small number.  This would happen if we call
+	 * this function again while the zone was still being reset, since we'll
+	 * still believe that job needs more zones.
+	 *
+	 * The presence of this argument reflects the need to refactor this
+	 * mechanism.
+	 */
+	if (nzonesdelta > 0 && willact) {
+		delete (ogroups[maxgroup.g_groupid]);
+	}
+
 	return (nzonesdelta);
 };
 
@@ -3321,7 +3325,7 @@ mAgent.prototype.taskStreamAdvance = function (stream, callback)
 
 	stop = stream.s_error !== undefined ||
 	    this.ma_zones[stream.s_machine].z_quiesced !== undefined ||
-	    this.schedGroupOversched(stream.s_group, 'choose') > 0;
+	    this.schedGroupOversched(stream.s_group, 'choose', true) > 0;
 
 	if (stop || stream.s_group.g_tasks.length === 0) {
 		if (stream.s_error &&
