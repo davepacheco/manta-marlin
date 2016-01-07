@@ -96,6 +96,7 @@ module.exports = {
 	    }
 	},
 
+	'slopAwareScheduling': mod_schema.sBoolean,
 	'zoneDefaultImage': mod_schema.sStringRequiredNonEmpty,
 
 	'zoneDefaults': {

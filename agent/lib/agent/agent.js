@@ -461,6 +461,21 @@ function mAgent(filename)
 		agent.ma_kstat_readers[name] = new mod_kstat.Reader(filter);
 	});
 
+	/*
+	 * We provide a chicken switch for disabling the slop-aware scheduling
+	 * behavior.  You should modify the agent configuration rather than
+	 * changing this value.  We should never need to change it at all
+	 * (either in the configuration or here), but this gives us an out if
+	 * the slop-aware scheduler starts behaving poorly.
+	 */
+	this.ma_slopawaresched =
+	    this.ma_conf.hasOwnProperty('slopAwareScheduling') ?
+	    this.ma_conf['slopAwareScheduling'] : true;
+
+	if (!this.ma_slopawaresched) {
+		this.ma_log.warn('slop-aware scheduling is disabled');
+	}
+
 	mod_http.globalAgent.maxSockets =
 	    this.ma_conf['tunables']['httpMaxSockets'] || 512;
 
@@ -2396,10 +2411,15 @@ mAgent.prototype.schedGroupShare = function (group)
 		return (0);
 	}
 
-	pct = Math.min(
-	    this.schedGroupShareConcurrency(group, ntasks),
-	    this.schedGroupShareMemory(group, ntasks),
-	    this.schedGroupShareDisk(group, ntasks));
+	if (this.ma_slopawaresched) {
+		pct = Math.min(
+		    this.schedGroupShareConcurrency(group, ntasks),
+		    this.schedGroupShareMemory(group, ntasks),
+		    this.schedGroupShareDisk(group, ntasks));
+	} else {
+		pct = this.schedGroupShareConcurrency(group, ntasks);
+	}
+
 	mod_assert.ok(pct >= 0 && pct <= 1);
 	capacity = this.ma_zonepools[group.g_poolid].unreservedCapacity();
 	nzones = Math.floor(capacity * pct);
@@ -2500,8 +2520,13 @@ mAgent.prototype.schedGroupOversched = function (group, reason)
 	 * so we take the max of these to figure out an overall number.
 	 */
 	pctz = this.schedGroupOverschedConcurrency(group, ngrouptasks);
-	pctm = this.schedGroupOverschedMemory(group, ngrouptasks);
-	pctd = this.schedGroupOverschedDisk(group, ngrouptasks);
+	if (this.ma_slopawaresched) {
+		pctm = this.schedGroupOverschedMemory(group, ngrouptasks);
+		pctd = this.schedGroupOverschedDisk(group, ngrouptasks);
+	} else {
+		pctm = 0;
+		pctd = 0;
+	}
 
 	/*
 	 * Disk and memory limiters take precedence because their calculations
@@ -2564,6 +2589,7 @@ mAgent.prototype.schedGroupOverschedConcurrency = function (group, ngrouptasks)
  */
 mAgent.prototype.schedGroupOverschedMemory = function (group, ngrouptasks)
 {
+	mod_assert.ok(this.ma_slopawaresched);
 	return (this.schedGroupOverschedEstimate(group, ngrouptasks,
 	    this.ma_slopmem_wanted, this.taskGroupMemSlop(group)));
 };
@@ -2573,6 +2599,7 @@ mAgent.prototype.schedGroupOverschedMemory = function (group, ngrouptasks)
  */
 mAgent.prototype.schedGroupOverschedDisk = function (group, ngrouptasks)
 {
+	mod_assert.ok(this.ma_slopawaresched);
 	return (this.schedGroupOverschedEstimate(group, ngrouptasks,
 	    this.ma_slopdisk_wanted, this.taskGroupDiskSlop(group)));
 };
@@ -2687,6 +2714,7 @@ mAgent.prototype.schedGroupOverschedSlop = function (group, which)
 	var agent = this;
 
 	mod_assert.ok(which == 'memory' || which == 'disk');
+	mod_assert.ok(this.ma_slopawaresched);
 
 	if (which == 'disk') {
 		ogroups = this.ma_slopdisk_groups;
@@ -2775,29 +2803,36 @@ mAgent.prototype.schedIdlePool = function (poolid, zoneadded)
 		memwanted = agent.taskGroupMemSlop(group);
 		diskwanted = agent.taskGroupDiskSlop(group);
 
-		if (memwanted > agent.ma_slopmem) {
+		oomem = (memwanted > agent.availMemSlop());
+		oodisk = (diskwanted > agent.availDiskSlop());
+
+		if (memwanted > agent.ma_slopmem ||
+		    (!agent.ma_slopawaresched && oomem)) {
 			/*
 			 * This task group can never be satisfied on this
 			 * system.  This generally indicates a misconfiguration
 			 * between what users are allowed to request for slop
-			 * and what can be provided by the system.
+			 * and what can be provided by the system.  (Or, we've
+			 * disabled slop-aware scheduling, and we're mimicking
+			 * historical behavior when a job cannot immediately get
+			 * slop resources to start running.)
 			 */
 			group.g_state = maTaskGroup.TASKGROUP_S_INIT;
 			agent.taskGroupError(group, maNoMemError);
 			continue;
 		}
 
-		if (diskwanted > agent.ma_slopdisk) {
+		if (diskwanted > agent.ma_slopdisk ||
+		    (!agent.ma_slopawaresched && oodisk)) {
 			/* See above. */
 			group.g_state = maTaskGroup.TASKGROUP_S_INIT;
 			agent.taskGroupError(group, maNoDiskError);
 			continue;
 		}
 
-		oomem = (memwanted > agent.availMemSlop());
-		oodisk = (diskwanted > agent.availDiskSlop());
-
 		if (oomem || oodisk) {
+			mod_assert.ok(agent.ma_slopawaresched);
+
 			if (!agent.ma_logthrottle.throttle(sprintf(
 			    'group %s out of slop', group.g_groupid))) {
 				group.g_log.info({
