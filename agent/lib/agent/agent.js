@@ -573,8 +573,8 @@ function mAgent(filename)
 	 * percentage of total physical memory on the system.  Memory from this
 	 * pool is allocated to zones whose tasks request it (by specifying the
 	 * "memory" property on the job phase).  Groups needing memory slop and
-	 * having no zones are queued onto ma_slopmem_groups for use in
-	 * scheduling decisions.  See schedGroupOversched().
+	 * having no zones are stored in ma_slopmem_groups for use in scheduling
+	 * decisions.  See schedGroupOversched().
 	 */
 	var pct = this.ma_conf['tunables']['zoneMemorySlopPercent'] / 100;
 	this.ma_slopmem = Math.floor(pct * mod_os.totalmem() / 1024 / 1024);
@@ -2391,13 +2391,6 @@ mAgent.prototype.schedGroupShare = function (group)
 {
 	var ntasks, pct, capacity, nzones;
 
-	/*
-	 * The number of running tasks (g_nrunning) is almost the same as the
-	 * number of streams (g_nstreams), but during initialization the task
-	 * that will be run on some stream may still be on g_tasks, in which
-	 * case we would double-count it here.  We also don't want to count idle
-	 * streams.
-	 */
 	ntasks = this.schedGroupShareNtasks(group);
 	if (ntasks === 0) {
 		return (0);
@@ -2413,6 +2406,9 @@ mAgent.prototype.schedGroupShare = function (group)
 	return (Math.min(ntasks, Math.max(1, nzones)));
 };
 
+/*
+ * See schedGroupShare().
+ */
 mAgent.prototype.schedGroupShareNtasks = function (group)
 {
 	/*
@@ -2425,6 +2421,11 @@ mAgent.prototype.schedGroupShareNtasks = function (group)
 	return (group.g_nrunning + group.g_tasks.length);
 };
 
+/*
+ * See schedGroupShare() and the comment at the top of this file.  Concurrency
+ * share is the fraction of total zones this group should get based on the
+ * number of tasks it has ready to run.
+ */
 mAgent.prototype.schedGroupShareConcurrency = function (group, ntasks)
 {
 	mod_assert.ok(ntasks <= this.ma_ntasks);
@@ -2435,6 +2436,11 @@ mAgent.prototype.schedGroupShareConcurrency = function (group, ntasks)
 	return (ntasks / this.ma_ntasks);
 };
 
+/*
+ * See schedGroupShare() and the comment at the top of this file.  Memory share
+ * is the fraction of total zones this group should get based on the amount of
+ * slop memory it needs compared to the slop demand on the whole system.
+ */
 mAgent.prototype.schedGroupShareMemory = function (group, ntasks)
 {
 	var memwanted;
@@ -2448,6 +2454,11 @@ mAgent.prototype.schedGroupShareMemory = function (group, ntasks)
 	return (memwanted / this.ma_slopmem_wanted);
 };
 
+/*
+ * See schedGroupShare() and the comment at the top of this file.  Disk share
+ * is the fraction of total zones this group should get based on the amount of
+ * slop disk it needs compared to the slop demand on the whole system.
+ */
 mAgent.prototype.schedGroupShareDisk = function (group, ntasks)
 {
 	var diskwanted;
@@ -2463,7 +2474,13 @@ mAgent.prototype.schedGroupShareDisk = function (group, ntasks)
 
 /*
  * Determines how many zones the given task group should give up because it has
- * been allocated more zones than we now want it to have.
+ * been allocated more zones than we now want it to have.  Since we allow
+ * groups to have idle zones when the system is uncontended, being overscheduled
+ * is not the same as having more zones than your share.  Rather, each group's
+ * share is a minimum number of zones it should have, and that's what the group
+ * will get when the system is saturated.  But a group is not actually
+ * overscheduled unless it has more zones than whatever's left over when all
+ * other groups' minimums are met.
  */
 mAgent.prototype.schedGroupOversched = function (group, reason)
 {
@@ -2476,14 +2493,6 @@ mAgent.prototype.schedGroupOversched = function (group, reason)
 	nothertasks = this.ma_ntasks - ngrouptasks;
 
 	/*
-	 * Since we allow groups to have idle zones when the system is
-	 * uncontended, being overscheduled is not the same as having more zones
-	 * than your share.  Rather, each group's share is a minimum number of
-	 * zones it should have, and that's what the group will get when the
-	 * system is saturated.  But a group is not actually overscheduled
-	 * unless it has more zones than whatever's left over when all other
-	 * groups' minimums are met.
-	 *
 	 * First, compute overscheduling from the perspective of each of our
 	 * three resources: concurrency, memory, and disk.  Each of these helper
 	 * functions returns the percentage of available zones that should be
@@ -2497,14 +2506,14 @@ mAgent.prototype.schedGroupOversched = function (group, reason)
 	/*
 	 * Disk and memory limiters take precedence because their calculations
 	 * are necessary to preserve fairness for tiny jobs.  For concurrency
-	 * limiters, the reserve zones serve that purpose.
+	 * limiters, the reserve zone mechanism is what ensures fairness.
 	 */
 	if (pctm > 0 && pctm >= pctz && pctm >= pctd) {
 		limiter = 'pctm';
-		rv = this.schedGroupOverschedSlopResource(group, 'memory');
+		rv = this.schedGroupOverschedSlop(group, 'memory');
 	} else if (pctd > 0 && pctd >= pctm && pctd >= pctz) {
 		limiter = 'pctd';
-		rv = this.schedGroupOverschedSlopResource(group, 'disk');
+		rv = this.schedGroupOverschedSlop(group, 'disk');
 	} else {
 		/*
 		 * This group is bound by its concurrency share.  Multiply the
@@ -2541,32 +2550,62 @@ mAgent.prototype.schedGroupOversched = function (group, reason)
 	return (rv);
 };
 
+/*
+ * See schedGroupOversched().
+ */
 mAgent.prototype.schedGroupOverschedConcurrency = function (group, ngrouptasks)
 {
-	return (this.schedGroupOverschedResource(group, ngrouptasks,
+	return (this.schedGroupOverschedEstimate(group, ngrouptasks,
 	    this.ma_ntasks, 1));
 };
 
+/*
+ * See schedGroupOversched().
+ */
 mAgent.prototype.schedGroupOverschedMemory = function (group, ngrouptasks)
 {
-	return (this.schedGroupOverschedResource(group, ngrouptasks,
+	return (this.schedGroupOverschedEstimate(group, ngrouptasks,
 	    this.ma_slopmem_wanted, this.taskGroupMemSlop(group)));
 };
 
+/*
+ * See schedGroupOversched().
+ */
 mAgent.prototype.schedGroupOverschedDisk = function (group, ngrouptasks)
 {
-	return (this.schedGroupOverschedResource(group, ngrouptasks,
+	return (this.schedGroupOverschedEstimate(group, ngrouptasks,
 	    this.ma_slopdisk_wanted, this.taskGroupDiskSlop(group)));
 };
 
 /*
- * schedGroupOverschedResource() uses a relatively cheap calculation to figure
- * whether the given task group is using more than its share.  If we decide that
- * it's using more of its slop share (of either disk or memory), we'll use a
- * more expensive approach to figure out by how much the group is overscheduled.
- * See schedGroupOverschedSlopResource().
+ * See schedGroupOversched().
+ *
+ * Returns an estimate of whether the given task group is using more than its
+ * share of a given resource (which may be zones, slop memory, or slop disk):
+ *
+ *     group		the task group
+ *
+ *     ngrouptasks	the number of tasks in this group
+ *
+ *     ntotalwanted	the total amount of the resource that's wanted.  For the
+ *     			"zones" resource, this is the total count of tasks in
+ *     			the system.  For the "memory" and "disk" resource, this
+ *     			is the count of tasks multiplied by the amount of slop
+ *     			memory or disk needed by each task.
+ *
+ *     pertask		the amount of the resource that's needed for each task
+ *     			in this group.  For the "zones" resource, this is always
+ *     			1.  For the "memory" and "disk" resources, this is the
+ *     			amount of memory or disk slop that the user requested
+ *     			for tasks in this phase.
+ *
+ * This is intended to be a cheap estimate, used to determine which of the
+ * possible resources ("zones", "memory", or "disk") are the limiting factor.
+ * If we decide that the limiter is "memory" or "disk", we'll perform a more
+ * expensive calculation to determine exactly how many zones should be
+ * reclaimed using schedGroupOverschedSlop().
  */
-mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
+mAgent.prototype.schedGroupOverschedEstimate = function (group, ngrouptasks,
     ntotalwanted, pertask)
 {
 	var notherwanted;
@@ -2588,8 +2627,8 @@ mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
 };
 
 /*
- * schedGroupOverschedSlopResource() is used when we've already determined
- * (based on the return value of schedGroupOverschedResource()) that a group is
+ * schedGroupOverschedSlop() is used when we've already determined
+ * (based on the return value of schedGroupOverschedEstimate()) that a group is
  * overscheduled and we want to figure out how many zones it should return.
  * As the name implies, this is only used for slop resources (disk and memory).
  * If a group is overscheduled purely based on its zone share, it's easy to
@@ -2597,10 +2636,10 @@ mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
  * schedGroupOversched().
  *
  * Computing overscheduling in this case is more complicated.  The group is
- * really overscheduled by an amount of _memory_, not zones, but ultimately we
- * need to decide how many zones that corresponds to.  The conversion ratio is
- * not fixed, but rather determined by the amount of slop memory needed by the
- * other jobs that this job is starving out.
+ * really overscheduled by an amount of _memory_ or _disk_, not zones, but
+ * ultimately we need to decide how many zones that corresponds to.  The
+ * conversion ratio is not fixed, but rather determined by the amount of slop
+ * memory needed by the other jobs that this job is starving out.
  *
  * As an example, suppose:
  *
@@ -2618,28 +2657,29 @@ mAgent.prototype.schedGroupOverschedResource = function (group, ngrouptasks,
  *
  * For both liveness and fairness, the desired behavior is for group B to be
  * allocated one zone.  It's a tiny percentage of all shares, so it shouldn't
- * get more than one, but it shouldn't be blocked indefinitely by group A.
+ * get more than one, but it shouldn't be blocked indefinitely by group A
+ * either.
  *
  * If we just look at shares, group A continues to get all 50 zones because in
  * terms of both concurrency and memory, group B's shares (as a fraction of
  * available zones) add up to less than one zone.  Note that this is a problem
  * even without involving slop in the example, but without the slop constraint,
- * group B would be assigned one of the reserve zones, so it works out anyway.
- * We don't have a reserve slop, though, and it's not clear that would be a good
- * way to deal with this problem anyway.  (Sizing such a pool would be much more
+ * group B would be assigned one of the reserve zones, so it works out.  We
+ * don't have a reserve slop, though, and it's not clear that would be a good
+ * way to deal with this problem.  (Sizing such a pool would be much more
  * complicated than sizing the zone reserve pool, since different groups need
  * different amounts of slop just to get started.)
  *
  * To address this, we take the following (relatively) simple approach: we keep
  * track of task groups that need slop resources AND that currently have no
  * zones.  When it comes time to deciding whether a group is overscheduled
- * that's using slop resources, we examine those groups.  The goal is to give up
- * enough zones so that at least one of those groups can start running.  To
- * calculate that, we need to see how much slop memory one of those groups
+ * that's using slop resources, we examine the waiting groups.  The goal is to
+ * give up enough zones so that at least one of those groups can start running.
+ * To calculate that, we need to see how much slop memory one of those groups
  * needs, and then figure out how many of our own zones we'd have to give up to
  * make that much memory available.
  */
-mAgent.prototype.schedGroupOverschedSlopResource = function (group, which)
+mAgent.prototype.schedGroupOverschedSlop = function (group, which)
 {
 	var maxgroup, ogroups;
 	var slopForGroup, slopForMaxGroup;
@@ -2662,11 +2702,19 @@ mAgent.prototype.schedGroupOverschedSlopResource = function (group, which)
 	/*
 	 * Currently, we examine all groups and take the max.  This errs on the
 	 * side of taking away more zones from big-share groups in order to
-	 * satisfy small-share, large-slop-using groups.  Another problem with
-	 * this approach is that multiple large-share groups may together
-	 * sacrifice zones than necessary for a small-share group, the result
-	 * being more zone resets than necessary.  However, this approach makes
-	 * it much more likely that we will eventually be able to satisfy groups
+	 * satisfy small-share, large-slop-using groups.
+	 *
+	 * Another problem with this approach is that because this function is
+	 * invoked not just when we're going to take action, but also as part of
+	 * just identifying hogs for possible future action, we cannot assumem
+	 * here that the zones we pick out _will_ be given up.  As a result, we
+	 * cannot actually remove the group from "ogroups".  As a result,
+	 * multiple large jobs may end up giving up zones to the same small job.
+	 * In fact, the same large job can end up giving up more zones than it
+	 * should, if this check is repeated while the zone is still being
+	 * reset.  The result of this is more zone resets than necessary, and
+	 * less concurrency than ideal for the larger groups, but it does make
+	 * it more likely that we will eventually be able to satisfy groups
 	 * needing a lot of slop per stream, which is important to preserve
 	 * liveness.
 	 */
@@ -3715,8 +3763,9 @@ mAgent.prototype.zonesDiscoverFini = function (err, zones)
  * In order to make it easy to build tools for reporting on our scheduler, we
  * periodically report the counts of:
  *
- *     o idle zones (see elsewhere -- these are _not_ zones available for use by
- *       any job)
+ *     o idle zones (see elsewhere -- this does not refer to zones that are
+ *       available for use by jobs at large, but rather those left assigned to
+ *       existing jobs even without work to do)
  *
  *     o zones being reset, which includes
  *
